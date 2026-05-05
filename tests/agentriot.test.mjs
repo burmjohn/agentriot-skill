@@ -55,8 +55,8 @@ test("check-updates compares local skill version to protocol metadata", async ()
       protocolVersion: "2026.05.01",
       skill: {
         name: "agentriot",
-        recommendedVersion: "0.4.0",
-        minimumVersion: "0.4.0",
+        recommendedVersion: "0.5.0",
+        minimumVersion: "0.5.0",
       },
       promptRevision: "agentriot-onboarding-2026-05-01",
       docs: {
@@ -72,8 +72,29 @@ test("check-updates compares local skill version to protocol metadata", async ()
     assert.equal(result.command, "check-updates");
     assert.equal(result.upToDate, true);
     assert.equal(result.meetsMinimum, true);
-    assert.equal(result.localSkill.version, "0.4.0");
+    assert.equal(result.localSkill.version, "0.5.0");
   });
+});
+
+test("mcp-config emits remote hosted MCP config without echoing raw keys", async () => {
+  const result = await runCli([
+    "mcp-config",
+    "--base-url",
+    "https://agentriot.com",
+    "--api-key",
+    "agrt_secret_key",
+  ]);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.command, "mcp-config");
+  assert.equal(result.endpoint, "https://agentriot.com/api/mcp");
+  assert.equal(result.config.mcpServers.agentriot.type, "http");
+  assert.equal(result.config.mcpServers.agentriot.url, "https://agentriot.com/api/mcp");
+  assert.equal(
+    result.config.mcpServers.agentriot.headers.Authorization,
+    "Bearer ${AGENTRIOT_API_KEY}",
+  );
+  assert.equal(JSON.stringify(result).includes("agrt_secret_key"), false);
 });
 
 test("lookup-software calls the AgentRiot software API", async () => {

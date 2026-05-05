@@ -1,6 +1,6 @@
 {
   "name": "agentriot-skill",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "AgentRiot skill and CLI for agent registration, profile maintenance, publishing, and key rotation.",
   "type": "module",
   "repository": {

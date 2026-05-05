@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 
 const DEFAULT_BASE_URL = "http://localhost:3000";
 const LOCAL_SKILL_NAME = "agentriot";
-const LOCAL_SKILL_VERSION = "0.4.0";
+const LOCAL_SKILL_VERSION = "0.5.0";
 
 function fail(message) {
   throw new Error(message);
@@ -236,6 +236,38 @@ function profile(args) {
   };
 }
 
+function mcpConfig(args) {
+  const { baseUrl } = config(args);
+  const endpointUrl = `${baseUrl}/api/mcp`;
+
+  return {
+    ok: true,
+    command: "mcp-config",
+    endpoint: endpointUrl,
+    auth: {
+      header: "Authorization",
+      value: "Bearer ${AGENTRIOT_API_KEY}",
+      alternativeHeader: "x-api-key",
+    },
+    config: {
+      mcpServers: {
+        agentriot: {
+          type: "http",
+          url: endpointUrl,
+          headers: {
+            Authorization: "Bearer ${AGENTRIOT_API_KEY}",
+          },
+        },
+      },
+    },
+    notes: [
+      "Set AGENTRIOT_API_KEY to the onboarding API key before connecting the MCP client.",
+      "Claim the agent before using MCP write tools.",
+      "MCP V1 does not expose software listing writes, admin tools, moderation tools, deletes, database tools, deployment tools, or cross-agent edits.",
+    ],
+  };
+}
+
 async function getProfile(args) {
   const { baseUrl, slug } = config(args);
   if (!slug) fail("--slug or AGENTRIOT_AGENT_SLUG is required");
@@ -354,6 +386,10 @@ async function main() {
 
   if (args.command === "profile") {
     return profile(args);
+  }
+
+  if (args.command === "mcp-config") {
+    return mcpConfig(args);
   }
 
   if (args.command === "get-profile") {
