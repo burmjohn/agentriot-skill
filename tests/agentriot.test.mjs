@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -55,8 +55,8 @@ test("check-updates compares local skill version to protocol metadata", async ()
       protocolVersion: "2026.05.01",
       skill: {
         name: "agentriot",
-        recommendedVersion: "0.5.0",
-        minimumVersion: "0.5.0",
+        recommendedVersion: "0.6.0",
+        minimumVersion: "0.6.0",
       },
       promptRevision: "agentriot-onboarding-2026-05-01",
       docs: {
@@ -72,15 +72,13 @@ test("check-updates compares local skill version to protocol metadata", async ()
     assert.equal(result.command, "check-updates");
     assert.equal(result.upToDate, true);
     assert.equal(result.meetsMinimum, true);
-    assert.equal(result.localSkill.version, "0.5.0");
+    assert.equal(result.localSkill.version, "0.6.0");
   });
 });
 
 test("mcp-config emits remote hosted MCP config without echoing raw keys", async () => {
   const result = await runCli([
     "mcp-config",
-    "--base-url",
-    "https://agentriot.com",
     "--api-key",
     "agrt_secret_key",
   ]);
@@ -95,6 +93,21 @@ test("mcp-config emits remote hosted MCP config without echoing raw keys", async
     "Bearer ${AGENTRIOT_API_KEY}",
   );
   assert.equal(JSON.stringify(result).includes("agrt_secret_key"), false);
+});
+
+test("CLI defaults to AgentRiot production for static commands", async () => {
+  const result = await runCli(["profile", "--slug", "my-research-agent"]);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.publicUrl, "https://agentriot.com/agents/my-research-agent");
+});
+
+test("write commands do not contain a production confirmation guard", async () => {
+  const source = await readFile(scriptPath, "utf8");
+
+  assert.equal(source.includes("confirm-production"), false);
+  assert.equal(source.includes("assertProductionWriteAllowed"), false);
+  assert.equal(source.includes("isProductionBaseUrl"), false);
 });
 
 test("lookup-software calls the AgentRiot software API", async () => {
@@ -143,4 +156,29 @@ test("register posts an input JSON payload and returns one-time key metadata", a
     assert.equal(result.agent.slug, "lifecycle-agent");
     assert.equal(result.keyPrefix, "agrt_sec");
   });
+});
+
+test("public docs avoid maintainer-only command details and exclusion lists", async () => {
+  const root = new URL("../", import.meta.url);
+  const docs = [
+    await readFile(new URL("README.md", root), "utf8"),
+    await readFile(new URL("SKILL.md", root), "utf8"),
+  ].join("\n");
+  const forbidden = [
+    "localhost",
+    "--base-url",
+    "confirm-production",
+    "staging",
+    "software listing writes",
+    "admin content",
+    "moderation controls",
+    "database tooling",
+    "deployment tooling",
+    "destructive deletes",
+    "cross-agent",
+  ];
+
+  for (const phrase of forbidden) {
+    assert.equal(docs.includes(phrase), false, `unexpected public docs phrase: ${phrase}`);
+  }
 });

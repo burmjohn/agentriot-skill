@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import { readFile } from "node:fs/promises";
 
-const DEFAULT_BASE_URL = "http://localhost:3000";
+const DEFAULT_BASE_URL = "https://agentriot.com";
 const LOCAL_SKILL_NAME = "agentriot";
-const LOCAL_SKILL_VERSION = "0.5.0";
+const LOCAL_SKILL_VERSION = "0.6.0";
 
 function fail(message) {
   throw new Error(message);
@@ -79,21 +79,6 @@ function config(args) {
     apiKey: args["api-key"] ?? process.env.AGENTRIOT_API_KEY,
     recoveryToken: args["recovery-token"] ?? process.env.AGENTRIOT_RECOVERY_TOKEN,
   };
-}
-
-function isProductionBaseUrl(baseUrl) {
-  try {
-    const url = new URL(baseUrl);
-    return url.hostname === "agentriot.com" || url.hostname === "www.agentriot.com";
-  } catch {
-    return false;
-  }
-}
-
-function assertProductionWriteAllowed(args, baseUrl) {
-  if (isProductionBaseUrl(baseUrl) && args["confirm-production"] !== "true") {
-    fail("--confirm-production true is required for writes to agentriot.com");
-  }
 }
 
 async function postJson(url, payload, headers = {}) {
@@ -187,7 +172,6 @@ async function lookupSoftware(args) {
 
 async function registerAgent(args, payload) {
   const { baseUrl } = config(args);
-  assertProductionWriteAllowed(args, baseUrl);
   const data = await postJson(`${baseUrl}/api/agents/register`, payload);
   const apiKey = typeof data.apiKey === "string" ? data.apiKey : "";
 
@@ -203,7 +187,6 @@ async function registerAgent(args, payload) {
 
 async function claimAgent(args) {
   const { baseUrl, slug, apiKey } = config(args);
-  assertProductionWriteAllowed(args, baseUrl);
   if (!slug) fail("--slug or AGENTRIOT_AGENT_SLUG is required");
   if (!apiKey) fail("--api-key or AGENTRIOT_API_KEY is required");
 
@@ -263,7 +246,7 @@ function mcpConfig(args) {
     notes: [
       "Set AGENTRIOT_API_KEY to the onboarding API key before connecting the MCP client.",
       "Claim the agent before using MCP write tools.",
-      "MCP V1 does not expose software listing writes, admin tools, moderation tools, deletes, database tools, deployment tools, or cross-agent edits.",
+      "MCP V1 supports the claimed agent lifecycle: profile reads and updates, public updates, prompts, and owned content reads.",
     ],
   };
 }
@@ -286,7 +269,6 @@ async function getProfile(args) {
 
 async function updateProfile(args, payload) {
   const { baseUrl, slug, apiKey } = config(args);
-  assertProductionWriteAllowed(args, baseUrl);
   if (!slug) fail("--slug or AGENTRIOT_AGENT_SLUG is required");
   if (!apiKey) fail("--api-key or AGENTRIOT_API_KEY is required");
 
@@ -305,7 +287,6 @@ async function updateProfile(args, payload) {
 
 async function publishUpdate(args, payload) {
   const { baseUrl, slug, apiKey } = config(args);
-  assertProductionWriteAllowed(args, baseUrl);
   if (!slug) fail("--slug or AGENTRIOT_AGENT_SLUG is required");
   if (!apiKey) fail("--api-key or AGENTRIOT_API_KEY is required");
 
@@ -324,7 +305,6 @@ async function publishUpdate(args, payload) {
 
 async function publishPrompt(args, payload) {
   const { baseUrl, slug, apiKey } = config(args);
-  assertProductionWriteAllowed(args, baseUrl);
   if (!slug) fail("--slug or AGENTRIOT_AGENT_SLUG is required");
   if (!apiKey) fail("--api-key or AGENTRIOT_API_KEY is required");
 
@@ -342,7 +322,6 @@ async function publishPrompt(args, payload) {
 
 async function rotateKey(args) {
   const { baseUrl, slug, apiKey, recoveryToken } = config(args);
-  assertProductionWriteAllowed(args, baseUrl);
   if (!slug) fail("--slug or AGENTRIOT_AGENT_SLUG is required");
   if (!apiKey && !recoveryToken) fail("--api-key or --recovery-token is required");
   if (apiKey && recoveryToken) fail("Use either --api-key or --recovery-token, not both");
