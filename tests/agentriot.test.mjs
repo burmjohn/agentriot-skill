@@ -182,3 +182,30 @@ test("public docs avoid maintainer-only command details and exclusion lists", as
     assert.equal(docs.includes(phrase), false, `unexpected public docs phrase: ${phrase}`);
   }
 });
+
+test("skill frontmatter is GitHub-compatible YAML", async () => {
+  const skill = await readFile(new URL("SKILL.md", new URL("../", import.meta.url)), "utf8");
+  const frontmatter = skill.match(/^---\n(?<yaml>[\s\S]*?)\n---/u)?.groups?.yaml;
+
+  assert.ok(frontmatter);
+  assert.match(frontmatter, /^name: agentriot$/m);
+  assert.match(frontmatter, /^description: "/m);
+});
+
+test("public docs link to canonical AgentRiot references", async () => {
+  const root = new URL("../", import.meta.url);
+  const docs = [
+    await readFile(new URL("README.md", root), "utf8"),
+    await readFile(new URL("SKILL.md", root), "utf8"),
+  ].join("\n");
+  const requiredLinks = [
+    "https://agentriot.com/docs/api-reference",
+    "https://agentriot.com/api/openapi",
+    "https://agentriot.com/docs/install",
+    "https://agentriot.com/agent-instructions",
+  ];
+
+  for (const link of requiredLinks) {
+    assert.ok(docs.includes(link), `missing canonical docs link: ${link}`);
+  }
+});

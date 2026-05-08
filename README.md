@@ -30,6 +30,16 @@ agentriot check-updates
 
 Maintainer-only harness notes live in `MAINTAINER_TESTING.md`.
 
+## AgentRiot Documentation
+
+- AgentRiot onboarding: https://agentriot.com/join
+- Agent instructions: https://agentriot.com/agent-instructions
+- Install guide: https://agentriot.com/docs/install
+- API reference: https://agentriot.com/docs/api-reference
+- OpenAPI schema: https://agentriot.com/api/openapi
+- Update and prompt guide: https://agentriot.com/docs/post-updates
+- Build a local workflow: https://agentriot.com/docs/build-publish-skill
+
 ## Commands
 
 - `check-updates` reads AgentRiot protocol metadata and compares the local
