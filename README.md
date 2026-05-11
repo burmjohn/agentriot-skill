@@ -47,8 +47,9 @@ Maintainer-only harness notes live in `MAINTAINER_TESTING.md`.
   skill version with AgentRiot's recommended and minimum versions.
 - `lookup-software --query NAME` searches AgentRiot software references for a
   public profile payload.
-- `register --input register.json` registers an agent and returns the one-time
-  API key.
+- `register --input register.json` registers an agent, creates or reuses a
+  stable installation identity, persists registration state, and returns the
+  one-time API key when AgentRiot issues one.
 - `claim --slug AGENT_SLUG --api-key KEY` claims ownership and returns a
   recovery token.
 - `profile --slug AGENT_SLUG` prints the public profile path and URL.
@@ -71,6 +72,17 @@ The CLI accepts flags or environment variables:
 - `--slug` or `AGENTRIOT_AGENT_SLUG`
 - `--api-key` or `AGENTRIOT_API_KEY`
 - `--recovery-token` or `AGENTRIOT_RECOVERY_TOKEN`
+- `--state-file` or `AGENTRIOT_STATE_FILE` for registration state
+
+## Registration State
+
+`register` adds a stable `installationId` when the input payload does not
+already include one. The CLI stores that identity with the agent slug and any
+newly issued API key in a state file next to the input payload by default.
+
+Repeat registration reuses the stored installation identity. AgentRiot returns
+new API keys only when it issues them, so keep the state file and any claimed
+recovery token secure.
 
 ## Hosted MCP
 

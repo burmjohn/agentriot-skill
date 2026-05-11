@@ -27,6 +27,10 @@ async function writePayload(name, payload) {
   return filePath;
 }
 
+async function readJsonFile(filePath) {
+  return JSON.parse(await readFile(filePath, "utf8"));
+}
+
 async function runCli(args) {
   const { stdout } = await execFileAsync("node", [scriptPath.pathname, ...args]);
   return JSON.parse(stdout);
@@ -55,8 +59,8 @@ test("check-updates compares local skill version to protocol metadata", async ()
       protocolVersion: "2026.05.01",
       skill: {
         name: "agentriot",
-        recommendedVersion: "0.6.0",
-        minimumVersion: "0.6.0",
+        recommendedVersion: "0.7.0",
+        minimumVersion: "0.7.0",
       },
       promptRevision: "agentriot-onboarding-2026-05-01",
       docs: {
@@ -72,7 +76,7 @@ test("check-updates compares local skill version to protocol metadata", async ()
     assert.equal(result.command, "check-updates");
     assert.equal(result.upToDate, true);
     assert.equal(result.meetsMinimum, true);
-    assert.equal(result.localSkill.version, "0.6.0");
+    assert.equal(result.localSkill.version, "0.7.0");
   });
 });
 
@@ -131,20 +135,23 @@ test("lookup-software calls the AgentRiot software API", async () => {
   });
 });
 
-test("register posts an input JSON payload and returns one-time key metadata", async () => {
+test("register generates and persists a stable installation identity with returned credentials", async () => {
   const inputPath = await writePayload("register.json", {
     name: "Lifecycle Agent",
     tagline: "Uses AgentRiot.",
     description: "Exercises registration.",
   });
+  const statePath = `${inputPath}.agentriot-state.json`;
+  let seenBody = null;
 
   await withServer(async (request, response) => {
     assert.equal(request.url, "/api/agents/register");
     const body = JSON.parse(await readRequestBody(request));
-    assert.equal(body.name, "Lifecycle Agent");
+    seenBody = body;
 
     response.writeHead(201, { "content-type": "application/json" });
     response.end(JSON.stringify({
+      registrationStatus: "created",
       agent: { id: "agt_1", slug: "lifecycle-agent", name: "Lifecycle Agent" },
       apiKey: "agrt_secret",
     }));
@@ -153,8 +160,58 @@ test("register posts an input JSON payload and returns one-time key metadata", a
 
     assert.equal(result.ok, true);
     assert.equal(result.command, "register");
+    assert.equal(seenBody.name, "Lifecycle Agent");
+    assert.equal(typeof seenBody.installationId, "string");
+    assert.ok(seenBody.installationId.length > 20);
     assert.equal(result.agent.slug, "lifecycle-agent");
     assert.equal(result.keyPrefix, "agrt_sec");
+    assert.equal(result.registrationStatus, "created");
+
+    const state = await readJsonFile(statePath);
+    assert.equal(state.installationId, result.installationId);
+    assert.equal(state.agentSlug, "lifecycle-agent");
+    assert.equal(state.apiKey, "agrt_secret");
+  });
+});
+
+test("register reuses the persisted installation identity on repeat registration", async () => {
+  const inputPath = await writePayload("register.json", {
+    name: "Lifecycle Agent",
+    tagline: "Uses AgentRiot.",
+    description: "Exercises registration.",
+  });
+  const statePath = `${inputPath}.agentriot-state.json`;
+  await writeFile(statePath, JSON.stringify({
+    installationId: "install_existing_1234567890",
+    agentSlug: "lifecycle-agent",
+    apiKey: "agrt_existing",
+  }), "utf8");
+  let seenBody = null;
+
+  await withServer(async (request, response) => {
+    assert.equal(request.url, "/api/agents/register");
+    const body = JSON.parse(await readRequestBody(request));
+    seenBody = body;
+
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      registrationStatus: "existing",
+      agent: { id: "agt_1", slug: "lifecycle-agent", name: "Lifecycle Agent" },
+      apiKey: null,
+    }));
+  }, async (baseUrl) => {
+    const result = await runCli(["register", "--input", inputPath, "--base-url", baseUrl]);
+
+    assert.equal(result.ok, true);
+    assert.equal(result.command, "register");
+    assert.equal(seenBody.installationId, "install_existing_1234567890");
+    assert.equal(result.registrationStatus, "existing");
+    assert.equal(result.apiKeyReturned, false);
+    assert.equal(result.storedApiKeyAvailable, true);
+
+    const state = await readJsonFile(statePath);
+    assert.equal(state.installationId, "install_existing_1234567890");
+    assert.equal(state.apiKey, "agrt_existing");
   });
 });
 

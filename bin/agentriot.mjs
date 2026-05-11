@@ -1,9 +1,11 @@
 #!/usr/bin/env node
-import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 
 const DEFAULT_BASE_URL = "https://agentriot.com";
 const LOCAL_SKILL_NAME = "agentriot";
-const LOCAL_SKILL_VERSION = "0.6.0";
+const LOCAL_SKILL_VERSION = "0.7.0";
 
 function fail(message) {
   throw new Error(message);
@@ -79,6 +81,55 @@ function config(args) {
     apiKey: args["api-key"] ?? process.env.AGENTRIOT_API_KEY,
     recoveryToken: args["recovery-token"] ?? process.env.AGENTRIOT_RECOVERY_TOKEN,
   };
+}
+
+function registrationStatePath(args) {
+  return args["state-file"] ?? process.env.AGENTRIOT_STATE_FILE ?? `${args.input}.agentriot-state.json`;
+}
+
+async function readRegistrationState(filePath) {
+  try {
+    const parsed = JSON.parse(await readFile(filePath, "utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return {};
+    }
+
+    fail(`Unable to read registration state: ${error.message}`);
+  }
+}
+
+function stableInstallationId(payload, state) {
+  if (typeof state.installationId === "string" && state.installationId.trim()) {
+    return state.installationId.trim();
+  }
+
+  if (typeof payload.installationId === "string" && payload.installationId.trim()) {
+    return payload.installationId.trim();
+  }
+
+  return `install_${randomUUID()}`;
+}
+
+async function writeRegistrationState(filePath, state) {
+  await mkdir(dirname(filePath), { recursive: true });
+  await writeFile(filePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  const readback = await readRegistrationState(filePath);
+
+  if (readback.installationId !== state.installationId) {
+    fail("Registration state readback failed for installationId.");
+  }
+
+  if (state.agentSlug && readback.agentSlug !== state.agentSlug) {
+    fail("Registration state readback failed for agentSlug.");
+  }
+
+  if (state.apiKey && readback.apiKey !== state.apiKey) {
+    fail("Registration state readback failed for apiKey.");
+  }
+
+  return readback;
 }
 
 async function postJson(url, payload, headers = {}) {
@@ -172,16 +223,39 @@ async function lookupSoftware(args) {
 
 async function registerAgent(args, payload) {
   const { baseUrl } = config(args);
-  const data = await postJson(`${baseUrl}/api/agents/register`, payload);
+  const statePath = registrationStatePath(args);
+  const state = await readRegistrationState(statePath);
+  const installationId = stableInstallationId(payload, state);
+  const data = await postJson(`${baseUrl}/api/agents/register`, {
+    ...payload,
+    installationId,
+  });
   const apiKey = typeof data.apiKey === "string" ? data.apiKey : "";
+  const agentSlug = typeof data.agent?.slug === "string" ? data.agent.slug : state.agentSlug;
+
+  if (!agentSlug) {
+    fail("Registration response did not include an agent slug.");
+  }
+
+  const persisted = await writeRegistrationState(statePath, {
+    ...state,
+    installationId,
+    agentSlug,
+    ...(apiKey ? { apiKey } : {}),
+  });
 
   return {
     ok: true,
     command: "register",
+    registrationStatus: data.registrationStatus ?? (apiKey ? "created" : "existing"),
     agent: data.agent,
+    installationId,
     apiKey,
     keyPrefix: apiKey ? apiKey.slice(0, 8) : null,
     apiKeyReturned: Boolean(apiKey),
+    stateFile: statePath,
+    storedApiKeyAvailable: typeof persisted.apiKey === "string" && persisted.apiKey.length > 0,
+    recovery: data.recovery ?? null,
   };
 }
 
