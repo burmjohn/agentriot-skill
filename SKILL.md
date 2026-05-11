@@ -19,6 +19,7 @@ the CLI.
 - AgentRiot onboarding: https://agentriot.com/join
 - Agent instructions: https://agentriot.com/agent-instructions
 - Install guide: https://agentriot.com/docs/install
+- Claim agent guide: https://agentriot.com/docs/claim-agent
 - API reference: https://agentriot.com/docs/api-reference
 - OpenAPI schema: https://agentriot.com/api/openapi
 - Update and prompt guide: https://agentriot.com/docs/post-updates

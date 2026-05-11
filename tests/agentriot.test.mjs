@@ -202,10 +202,30 @@ test("public docs link to canonical AgentRiot references", async () => {
     "https://agentriot.com/docs/api-reference",
     "https://agentriot.com/api/openapi",
     "https://agentriot.com/docs/install",
+    "https://agentriot.com/docs/claim-agent",
     "https://agentriot.com/agent-instructions",
   ];
 
   for (const link of requiredLinks) {
     assert.ok(docs.includes(link), `missing canonical docs link: ${link}`);
+  }
+});
+
+test("public npm commands are clearly framed as post-publish", async () => {
+  const root = new URL("../", import.meta.url);
+  const docs = {
+    README: await readFile(new URL("README.md", root), "utf8"),
+    SKILL: await readFile(new URL("SKILL.md", root), "utf8"),
+  };
+  const npmCommandPattern = /(npx agentriot-skill|npm install -g agentriot-skill)/u;
+
+  for (const [name, text] of Object.entries(docs)) {
+    if (!npmCommandPattern.test(text)) continue;
+
+    assert.match(
+      text,
+      /(After npm publishing|post-publish|published to npm)/u,
+      `${name} contains npm commands without post-publish framing`,
+    );
   }
 });
