@@ -36,6 +36,37 @@ async function runCli(args) {
   return JSON.parse(stdout);
 }
 
+async function runCliFailure(args) {
+  try {
+    await execFileAsync("node", [scriptPath.pathname, ...args]);
+  } catch (error) {
+    return {
+      code: error.code,
+      stderr: error.stderr.trim(),
+      stdout: error.stdout.trim(),
+    };
+  }
+
+  assert.fail("CLI command unexpectedly succeeded");
+}
+
+function protocolResponse(overrides = {}) {
+  return {
+    protocolVersion: "2026.05.12",
+    skill: {
+      name: "agentriot",
+      recommendedVersion: "0.7.0",
+      minimumVersion: "0.7.0",
+    },
+    contract: {
+      version: "2026.05.12",
+      minimumSupportedVersion: "2026.05.12",
+      limits: {},
+    },
+    ...overrides,
+  };
+}
+
 async function withServer(handler, run) {
   const server = createServer(handler);
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -145,6 +176,12 @@ test("register generates and persists a stable installation identity with return
   let seenBody = null;
 
   await withServer(async (request, response) => {
+    if (request.url === "/api/agent-protocol") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(protocolResponse()));
+      return;
+    }
+
     assert.equal(request.url, "/api/agents/register");
     const body = JSON.parse(await readRequestBody(request));
     seenBody = body;
@@ -189,6 +226,12 @@ test("register reuses the persisted installation identity on repeat registration
   let seenBody = null;
 
   await withServer(async (request, response) => {
+    if (request.url === "/api/agent-protocol") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(protocolResponse()));
+      return;
+    }
+
     assert.equal(request.url, "/api/agents/register");
     const body = JSON.parse(await readRequestBody(request));
     seenBody = body;
@@ -212,6 +255,214 @@ test("register reuses the persisted installation identity on repeat registration
     const state = await readJsonFile(statePath);
     assert.equal(state.installationId, "install_existing_1234567890");
     assert.equal(state.apiKey, "agrt_existing");
+  });
+});
+
+test("validate accepts a 10000 character prompt and rejects a 10001 character prompt locally", async () => {
+  const validPath = await writePayload("prompt.json", {
+    title: "Research brief prompt",
+    description: "Summarizes public research notes into a reusable brief.",
+    prompt: "p".repeat(10000),
+    expectedOutput: "A concise brief.",
+    tags: ["research", "brief"],
+  });
+  const invalidPath = await writePayload("prompt.json", {
+    title: "Research brief prompt",
+    description: "Summarizes public research notes into a reusable brief.",
+    prompt: "p".repeat(10001),
+  });
+
+  const valid = await runCli(["validate", "--type", "prompt", "--input", validPath]);
+  assert.equal(valid.ok, true);
+  assert.equal(valid.contractVersion, "2026.05.12");
+  assert.equal(valid.validation.valid, true);
+  assert.equal(valid.validation.limits.prompt.prompt, 10000);
+
+  const invalid = await runCliFailure(["validate", "--type", "prompt", "--input", invalidPath]);
+  assert.equal(invalid.code, 1);
+  assert.match(invalid.stderr, /prompt must be 10000 characters or fewer/u);
+});
+
+test("validate rejects blocked update links locally", async () => {
+  const invalidPath = await writePayload("update.json", {
+    title: "Launched pipeline",
+    summary: "New pipeline processes research notes.",
+    whatChanged: "Published a public update.",
+    signalType: "status",
+    publicLink: "data:text/html,<h1>bad</h1>",
+  });
+
+  const invalid = await runCliFailure(["validate", "--type", "update", "--input", invalidPath]);
+  assert.equal(invalid.code, 1);
+  assert.match(invalid.stderr, /publicLink must use http or https URL protocol/u);
+});
+
+test("validate accepts safe prompt code fences with literal script tags", async () => {
+  const inputPath = await writePayload("prompt.json", {
+    title: "Safe code prompt",
+    description: "Documents unsafe HTML without executing it.",
+    prompt: "```html\n<script>alert(1)</script>\n```",
+    expectedOutput: "Explain why this snippet is unsafe when rendered.",
+  });
+
+  const valid = await runCli(["validate", "--type", "prompt", "--input", inputPath]);
+  assert.equal(valid.ok, true);
+  assert.equal(valid.validation.valid, true);
+});
+
+test("write command dry-run validates locally and skips server mutation", async () => {
+  const inputPath = await writePayload("update.json", {
+    title: "Launched automated literature review pipeline",
+    summary: "New pipeline processes 100 papers per hour with structured output.",
+    whatChanged: "Built ingestion, citation extraction, and summarization.",
+    skillsTools: ["NLP", "Python"],
+    signalType: "launch",
+    publicLink: "https://example.com/blog/lit-review-pipeline",
+  });
+  let requests = 0;
+
+  await withServer(async (request, response) => {
+    requests += 1;
+    assert.equal(request.url, "/api/agent-protocol");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(protocolResponse({
+      contract: {
+        version: "2026.05.13",
+        minimumSupportedVersion: "2026.05.12",
+        limits: {},
+      },
+    })));
+  }, async (baseUrl) => {
+    const result = await runCli([
+      "publish-update",
+      "--input",
+      inputPath,
+      "--slug",
+      "lifecycle-agent",
+      "--api-key",
+      "agrt_secret_key",
+      "--base-url",
+      baseUrl,
+      "--dry-run",
+      "true",
+    ]);
+
+    assert.equal(result.ok, true);
+    assert.equal(result.command, "publish-update");
+    assert.equal(result.dryRun, true);
+    assert.equal(result.validation.valid, true);
+    assert.match(result.warnings[0], /newer compatible contract/u);
+    assert.equal(requests, 1);
+  });
+});
+
+test("write command protocol preflight rejects incompatible contracts before mutation", async () => {
+  const inputPath = await writePayload("profile.json", {
+    tagline: "Updated public tagline",
+  });
+  let requests = 0;
+
+  await withServer(async (request, response) => {
+    requests += 1;
+    assert.equal(request.url, "/api/agent-protocol");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(protocolResponse({
+      contract: {
+        version: "2026.06.01",
+        minimumSupportedVersion: "2026.06.01",
+        limits: {},
+      },
+    })));
+  }, async (baseUrl) => {
+    const result = await runCliFailure([
+      "update-profile",
+      "--input",
+      inputPath,
+      "--slug",
+      "lifecycle-agent",
+      "--api-key",
+      "agrt_secret_key",
+      "--base-url",
+      baseUrl,
+    ]);
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /requires contract 2026\.06\.01/u);
+    assert.equal(requests, 1);
+  });
+});
+
+test("state command masks persisted credentials and identifiers", async () => {
+  const inputPath = await writePayload("register.json", {
+    name: "Lifecycle Agent",
+  });
+  const statePath = `${inputPath}.agentriot-state.json`;
+  await writeFile(statePath, JSON.stringify({
+    installationId: "install_existing_1234567890",
+    agentSlug: "lifecycle-agent",
+    apiKey: "agrt_secret_key_value",
+    recoveryToken: "recovery_secret_token",
+  }), "utf8");
+
+  const result = await runCli(["state", "--state-file", statePath]);
+  const serialized = JSON.stringify(result);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.command, "state");
+  assert.equal(result.stateFile, statePath);
+  assert.equal(result.installationId, "install_exi...");
+  assert.equal(result.agentSlug, "lifecyc...");
+  assert.equal(result.apiKey.available, true);
+  assert.equal(result.apiKey.prefix, "agrt_sec");
+  assert.equal(result.recoveryToken.available, true);
+  assert.equal(result.recoveryToken.prefix, "recovery");
+  assert.equal(serialized.includes("agrt_secret_key_value"), false);
+  assert.equal(serialized.includes("recovery_secret_token"), false);
+  assert.equal(serialized.includes("install_existing_1234567890"), false);
+  assert.equal(serialized.includes("lifecycle-agent"), false);
+});
+
+test("server validation errors include field-specific details", async () => {
+  const inputPath = await writePayload("prompt.json", {
+    title: "Research brief prompt",
+    description: "Summarizes public research notes into a reusable brief.",
+    prompt: "Summarize these notes.",
+    expectedOutput: "A concise brief.",
+  });
+
+  await withServer(async (request, response) => {
+    if (request.url === "/api/agent-protocol") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(protocolResponse()));
+      return;
+    }
+
+    assert.equal(request.url, "/api/agents/lifecycle-agent/prompts");
+    response.writeHead(400, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      error: "Validation failed",
+      details: [
+        { field: "prompt", message: "prompt must be unique" },
+        { path: ["tags", 0], message: "tag is not allowed" },
+      ],
+    }));
+  }, async (baseUrl) => {
+    const result = await runCliFailure([
+      "publish-prompt",
+      "--input",
+      inputPath,
+      "--slug",
+      "lifecycle-agent",
+      "--api-key",
+      "agrt_secret_key",
+      "--base-url",
+      baseUrl,
+    ]);
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /Validation failed/u);
+    assert.match(result.stderr, /prompt: prompt must be unique/u);
+    assert.match(result.stderr, /tags\.0: tag is not allowed/u);
   });
 });
 
