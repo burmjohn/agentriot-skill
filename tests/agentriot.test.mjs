@@ -52,15 +52,15 @@ async function runCliFailure(args) {
 
 function protocolResponse(overrides = {}) {
   return {
-    protocolVersion: "2026.05.12",
+    protocolVersion: "2026.05.14",
     skill: {
       name: "agentriot",
-      recommendedVersion: "0.7.0",
-      minimumVersion: "0.7.0",
+      recommendedVersion: "0.8.0",
+      minimumVersion: "0.8.0",
     },
     contract: {
-      version: "2026.05.12",
-      minimumSupportedVersion: "2026.05.12",
+      version: "2026.05.14",
+      minimumSupportedVersion: "2026.05.14",
       limits: {},
     },
     ...overrides,
@@ -90,8 +90,8 @@ test("check-updates compares local skill version to protocol metadata", async ()
       protocolVersion: "2026.05.01",
       skill: {
         name: "agentriot",
-        recommendedVersion: "0.7.0",
-        minimumVersion: "0.7.0",
+        recommendedVersion: "0.8.0",
+        minimumVersion: "0.8.0",
       },
       promptRevision: "agentriot-onboarding-2026-05-01",
       docs: {
@@ -107,7 +107,7 @@ test("check-updates compares local skill version to protocol metadata", async ()
     assert.equal(result.command, "check-updates");
     assert.equal(result.upToDate, true);
     assert.equal(result.meetsMinimum, true);
-    assert.equal(result.localSkill.version, "0.7.0");
+    assert.equal(result.localSkill.version, "0.8.0");
   });
 });
 
@@ -274,7 +274,7 @@ test("validate accepts a 10000 character prompt and rejects a 10001 character pr
 
   const valid = await runCli(["validate", "--type", "prompt", "--input", validPath]);
   assert.equal(valid.ok, true);
-  assert.equal(valid.contractVersion, "2026.05.12");
+  assert.equal(valid.contractVersion, "2026.05.14");
   assert.equal(valid.validation.valid, true);
   assert.equal(valid.validation.limits.prompt.prompt, 10000);
 
@@ -327,8 +327,8 @@ test("write command dry-run validates locally and skips server mutation", async 
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify(protocolResponse({
       contract: {
-        version: "2026.05.13",
-        minimumSupportedVersion: "2026.05.12",
+        version: "2026.05.15",
+        minimumSupportedVersion: "2026.05.14",
         limits: {},
       },
     })));
@@ -463,6 +463,165 @@ test("server validation errors include field-specific details", async () => {
     assert.match(result.stderr, /Validation failed/u);
     assert.match(result.stderr, /prompt: prompt must be unique/u);
     assert.match(result.stderr, /tags\.0: tag is not allowed/u);
+  });
+});
+
+test("edit-update patches an existing timeline update", async () => {
+  const inputPath = await writePayload("update.json", {
+    title: "Updated launch note",
+    summary: "Clarifies the public launch summary.",
+    whatChanged: "Corrected the public-safe details.",
+    signalType: "status",
+    skillsTools: ["release"],
+  });
+
+  await withServer(async (request, response) => {
+    if (request.url === "/api/agent-protocol") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(protocolResponse()));
+      return;
+    }
+
+    assert.equal(request.method, "PATCH");
+    assert.equal(request.url, "/api/agents/lifecycle-agent/updates/launch-update");
+    assert.equal(request.headers["x-api-key"], "agrt_test_key");
+    assert.deepEqual(JSON.parse(await readRequestBody(request)), {
+      title: "Updated launch note",
+      summary: "Clarifies the public launch summary.",
+      whatChanged: "Corrected the public-safe details.",
+      signalType: "status",
+      skillsTools: ["release"],
+    });
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      update: {
+        id: "update_1",
+        slug: "launch-update",
+        title: "Updated launch note",
+      },
+    }));
+  }, async (baseUrl) => {
+    const result = await runCli([
+      "edit-update",
+      "--input",
+      inputPath,
+      "--slug",
+      "lifecycle-agent",
+      "--update-slug",
+      "launch-update",
+      "--api-key",
+      "agrt_test_key",
+      "--base-url",
+      baseUrl,
+    ]);
+
+    assert.equal(result.command, "edit-update");
+    assert.equal(result.publicPath, "/agents/lifecycle-agent/updates/launch-update");
+  });
+});
+
+test("edit-prompt patches an existing shared prompt", async () => {
+  const inputPath = await writePayload("prompt.json", {
+    title: "Updated research brief",
+    description: "Clarifies when to use the prompt.",
+    prompt: "Summarize the notes into findings and risks.",
+    expectedOutput: "Findings and risks.",
+    tags: ["research"],
+  });
+
+  await withServer(async (request, response) => {
+    if (request.url === "/api/agent-protocol") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(protocolResponse()));
+      return;
+    }
+
+    assert.equal(request.method, "PATCH");
+    assert.equal(request.url, "/api/agents/lifecycle-agent/prompts/research-brief");
+    assert.equal(request.headers["x-api-key"], "agrt_test_key");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      prompt: {
+        id: "prompt_1",
+        slug: "research-brief",
+        title: "Updated research brief",
+      },
+      publicPath: "/prompts/research-brief",
+    }));
+  }, async (baseUrl) => {
+    const result = await runCli([
+      "edit-prompt",
+      "--input",
+      inputPath,
+      "--slug",
+      "lifecycle-agent",
+      "--prompt-slug",
+      "research-brief",
+      "--api-key",
+      "agrt_test_key",
+      "--base-url",
+      baseUrl,
+    ]);
+
+    assert.equal(result.command, "edit-prompt");
+    assert.equal(result.publicPath, "/prompts/research-brief");
+  });
+});
+
+test("edit commands support dry-run validation without mutation", async () => {
+  const updatePath = await writePayload("update.json", {
+    title: "Updated launch note",
+    summary: "Clarifies the public launch summary.",
+    whatChanged: "Corrected the public-safe details.",
+    signalType: "status",
+  });
+  const promptPath = await writePayload("prompt.json", {
+    title: "Updated research brief",
+    description: "Clarifies when to use the prompt.",
+    prompt: "Summarize the notes into findings and risks.",
+    expectedOutput: "Findings and risks.",
+  });
+
+  await withServer((request, response) => {
+    assert.equal(request.url, "/api/agent-protocol");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(protocolResponse()));
+  }, async (baseUrl) => {
+    const update = await runCli([
+      "edit-update",
+      "--input",
+      updatePath,
+      "--slug",
+      "lifecycle-agent",
+      "--update-slug",
+      "launch-update",
+      "--api-key",
+      "agrt_test_key",
+      "--dry-run",
+      "true",
+      "--base-url",
+      baseUrl,
+    ]);
+    const prompt = await runCli([
+      "edit-prompt",
+      "--input",
+      promptPath,
+      "--slug",
+      "lifecycle-agent",
+      "--prompt-slug",
+      "research-brief",
+      "--api-key",
+      "agrt_test_key",
+      "--dry-run",
+      "true",
+      "--base-url",
+      baseUrl,
+    ]);
+
+    assert.equal(update.command, "edit-update");
+    assert.equal(update.dryRun, true);
+    assert.equal(prompt.command, "edit-prompt");
+    assert.equal(prompt.dryRun, true);
   });
 });
 

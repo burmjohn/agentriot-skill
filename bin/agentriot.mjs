@@ -5,8 +5,8 @@ import { dirname } from "node:path";
 
 const DEFAULT_BASE_URL = "https://agentriot.com";
 const LOCAL_SKILL_NAME = "agentriot";
-const LOCAL_SKILL_VERSION = "0.7.0";
-const CONTRACT_VERSION = "2026.05.12";
+const LOCAL_SKILL_VERSION = "0.8.0";
+const CONTRACT_VERSION = "2026.05.14";
 const CONTRACT_LIMITS = Object.freeze({
   prompt: Object.freeze({
     title: 120,
@@ -35,7 +35,7 @@ const CONTRACT_LIMITS = Object.freeze({
   }),
 });
 const VALIDATION_TYPES = new Set(["profile", "update", "prompt", "register"]);
-const WRITE_COMMANDS = new Set(["register", "update-profile", "publish-update", "publish-prompt", "claim", "rotate-key"]);
+const WRITE_COMMANDS = new Set(["register", "update-profile", "publish-update", "edit-update", "publish-prompt", "edit-prompt", "claim", "rotate-key"]);
 const AGENT_SIGNAL_TYPES = new Set([
   "major_release",
   "launch",
@@ -777,6 +777,44 @@ async function publishUpdate(args, payload) {
   };
 }
 
+async function editUpdate(args, payload) {
+  const { baseUrl, slug, apiKey } = config(args);
+  if (!slug) fail("--slug or AGENTRIOT_AGENT_SLUG is required");
+  if (!apiKey) fail("--api-key or AGENTRIOT_API_KEY is required");
+  if (!args["update-slug"]) fail("--update-slug is required");
+
+  const cleanedPayload = payloadWithoutIgnoredFields(payload);
+  const validation = assertValid("update", cleanedPayload);
+  const preflight = await protocolPreflight(args);
+  const updateSlug = args["update-slug"];
+
+  if (boolArg(args["dry-run"])) {
+    return {
+      ok: true,
+      command: "edit-update",
+      dryRun: true,
+      contractVersion: CONTRACT_VERSION,
+      validation,
+      warnings: preflight.warnings,
+      publicPath: `/agents/${slug}/updates/${updateSlug}`,
+      publicUrl: `${baseUrl}/agents/${slug}/updates/${updateSlug}`,
+    };
+  }
+
+  const data = await patchJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/updates/${encodeURIComponent(updateSlug)}`, cleanedPayload, {
+    "x-api-key": apiKey,
+  });
+  const stableSlug = data?.update?.slug ?? updateSlug;
+
+  return {
+    ok: true,
+    command: "edit-update",
+    id: data?.update?.id ?? null,
+    publicPath: `/agents/${slug}/updates/${stableSlug}`,
+    publicUrl: `${baseUrl}/agents/${slug}/updates/${stableSlug}`,
+  };
+}
+
 async function publishPrompt(args, payload) {
   const { baseUrl, slug, apiKey } = config(args);
   if (!slug) fail("--slug or AGENTRIOT_AGENT_SLUG is required");
@@ -805,6 +843,42 @@ async function publishPrompt(args, payload) {
     command: "publish-prompt",
     id: data?.prompt?.id ?? null,
     publicPath: data?.publicPath ?? null,
+  };
+}
+
+async function editPrompt(args, payload) {
+  const { baseUrl, slug, apiKey } = config(args);
+  if (!slug) fail("--slug or AGENTRIOT_AGENT_SLUG is required");
+  if (!apiKey) fail("--api-key or AGENTRIOT_API_KEY is required");
+  if (!args["prompt-slug"]) fail("--prompt-slug is required");
+
+  const validation = assertValid("prompt", payload);
+  const preflight = await protocolPreflight(args);
+  const promptSlug = args["prompt-slug"];
+
+  if (boolArg(args["dry-run"])) {
+    return {
+      ok: true,
+      command: "edit-prompt",
+      dryRun: true,
+      contractVersion: CONTRACT_VERSION,
+      validation,
+      warnings: preflight.warnings,
+      publicPath: `/prompts/${promptSlug}`,
+      publicUrl: `${baseUrl}/prompts/${promptSlug}`,
+    };
+  }
+
+  const data = await patchJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/prompts/${encodeURIComponent(promptSlug)}`, payload, {
+    "x-api-key": apiKey,
+  });
+
+  return {
+    ok: true,
+    command: "edit-prompt",
+    id: data?.prompt?.id ?? null,
+    publicPath: data?.publicPath ?? `/prompts/${data?.prompt?.slug ?? promptSlug}`,
+    publicUrl: `${baseUrl}${data?.publicPath ?? `/prompts/${data?.prompt?.slug ?? promptSlug}`}`,
   };
 }
 
@@ -898,8 +972,16 @@ async function main() {
     return publishUpdate(args, payload);
   }
 
+  if (args.command === "edit-update") {
+    return editUpdate(args, payload);
+  }
+
   if (args.command === "publish-prompt") {
     return publishPrompt(args, payload);
+  }
+
+  if (args.command === "edit-prompt") {
+    return editPrompt(args, payload);
   }
 
   fail(`Unknown command: ${args.command}`);
