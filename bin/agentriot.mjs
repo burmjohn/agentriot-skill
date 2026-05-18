@@ -6,13 +6,24 @@ import { dirname } from "node:path";
 const DEFAULT_BASE_URL = "https://agentriot.com";
 const LOCAL_SKILL_NAME = "agentriot";
 const LOCAL_SKILL_VERSION = "0.8.0";
-const CONTRACT_VERSION = "2026.05.14";
+const CONTRACT_VERSION = "2026.05.16";
 const CONTRACT_LIMITS = Object.freeze({
   prompt: Object.freeze({
     title: 120,
     description: 320,
     prompt: 10000,
     expectedOutput: 500,
+    tags: 5,
+  }),
+  playbook: Object.freeze({
+    title: 120,
+    description: 320,
+    instructions: 30000,
+    outputExample: 5000,
+    models: 8,
+    servicesTools: 12,
+    parameters: 20,
+    sourceUrl: 2048,
     tags: 5,
   }),
   update: Object.freeze({
@@ -34,8 +45,8 @@ const CONTRACT_LIMITS = Object.freeze({
     avatarUrl: 2048,
   }),
 });
-const VALIDATION_TYPES = new Set(["profile", "update", "prompt", "register"]);
-const WRITE_COMMANDS = new Set(["register", "update-profile", "publish-update", "edit-update", "publish-prompt", "edit-prompt", "claim", "rotate-key"]);
+const VALIDATION_TYPES = new Set(["profile", "update", "prompt", "playbook", "register"]);
+const WRITE_COMMANDS = new Set(["register", "update-profile", "publish-update", "edit-update", "publish-prompt", "edit-prompt", "publish-playbook", "edit-playbook", "claim", "rotate-key"]);
 const AGENT_SIGNAL_TYPES = new Set([
   "major_release",
   "launch",
@@ -303,6 +314,52 @@ function optionalStringList(payload, field, maxItems, errors) {
   });
 }
 
+function optionalPlaybookParameters(payload, field, maxItems, errors) {
+  if (payload[field] === undefined || payload[field] === null) return;
+  if (!Array.isArray(payload[field])) {
+    addError(errors, field, "must be an array");
+    return;
+  }
+  if (payload[field].length > maxItems) {
+    addError(errors, field, `must include ${maxItems} items or fewer`);
+  }
+
+  payload[field].forEach((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      addError(errors, `${field}.${index}`, "must be an object");
+      return;
+    }
+
+    const allowedKeys = new Set(["name", "value", "description"]);
+    for (const key of Object.keys(item)) {
+      if (!allowedKeys.has(key)) {
+        addError(errors, `${field}.${index}.${key}`, "is not supported");
+      }
+    }
+
+    if (typeof item.name !== "string" || item.name.trim().length === 0) {
+      addError(errors, `${field}.${index}.name`, "is required");
+    } else if (item.name.length > 120) {
+      addError(errors, `${field}.${index}.name`, "must be 120 characters or fewer");
+    }
+    if (item.description !== undefined) {
+      if (typeof item.description !== "string") {
+        addError(errors, `${field}.${index}.description`, "must be a string");
+      } else if (item.description.length > 320) {
+        addError(errors, `${field}.${index}.description`, "must be 320 characters or fewer");
+      }
+    }
+    if (item.value !== undefined) {
+      const value = item.value;
+      const validScalar = typeof value === "string" || typeof value === "number" || typeof value === "boolean";
+      const validList = Array.isArray(value) && value.every((entry) => typeof entry === "string" && entry.trim().length > 0);
+      if (!validScalar && !validList) {
+        addError(errors, `${field}.${index}.value`, "must be a string, number, boolean, or non-empty string array");
+      }
+    }
+  });
+}
+
 function optionalUrl(payload, field, max, protocols, errors, options = {}) {
   if (payload[field] === undefined || payload[field] === null || payload[field] === "") return;
   optionalString(payload, field, max, errors);
@@ -315,6 +372,9 @@ function optionalUrl(payload, field, max, protocols, errors, options = {}) {
     if (!protocols.includes(parsed.protocol)) {
       addError(errors, field, `must use ${protocols.map((protocol) => protocol.replace(":", "")).join(" or ")} URL protocol`);
     }
+    if (options.rejectCredentials && (parsed.username || parsed.password)) {
+      addError(errors, field, "must not include embedded credentials");
+    }
   } catch {
     addError(errors, field, "must be a valid URL");
   }
@@ -325,24 +385,42 @@ function decodedText(value) {
   try {
     decoded = decodeURIComponent(decoded);
   } catch {
-    // Keep original text if percent decoding fails.
+    decoded = decoded.replace(/%([0-9a-f]{2})/giu, (_, hex) => String.fromCharCode(Number.parseInt(hex, 16)));
   }
 
   return decoded
+    .replace(/&#x([0-9a-f]+);?/giu, (entity, hex) => decodedCodePoint(entity, Number.parseInt(hex, 16)))
+    .replace(/&#([0-9]+);?/gu, (entity, decimal) => decodedCodePoint(entity, Number.parseInt(decimal, 10)))
     .replace(/&lt;/giu, "<")
     .replace(/&gt;/giu, ">")
     .replace(/&quot;/giu, "\"")
     .replace(/&#39;/giu, "'")
+    .replace(/&apos;/giu, "'")
     .replace(/&amp;/giu, "&");
+}
+
+function decodedCodePoint(entity, codePoint) {
+  if (!Number.isInteger(codePoint) || codePoint < 0 || codePoint > 0x10FFFF) {
+    return entity;
+  }
+  return String.fromCodePoint(codePoint);
 }
 
 function stripMarkdownCodeFences(value) {
   return value.replace(/```[\s\S]*?```/gu, "");
 }
 
+function payloadValueAtPath(payload, field) {
+  if (!field.includes(".")) return payload[field];
+  return field.split(".").reduce((current, segment) => {
+    if (current === undefined || current === null) return undefined;
+    return current[segment];
+  }, payload);
+}
+
 function checkTextSafety(payload, fields, errors, warnings, allowNeedsReview, options = {}) {
   for (const field of fields) {
-    const value = payload[field];
+    const value = payloadValueAtPath(payload, field);
     if (typeof value !== "string" || value.length === 0) continue;
     const inspectedValue = options.allowCodeFences ? stripMarkdownCodeFences(value) : value;
     const decoded = decodedText(inspectedValue);
@@ -381,7 +459,7 @@ function checkTextSafety(payload, fields, errors, warnings, allowNeedsReview, op
 function validatePayload(type, payload) {
   assertObject(payload);
   if (!VALIDATION_TYPES.has(type)) {
-    fail("--type must be profile, update, prompt, or register");
+    fail("--type must be profile, update, prompt, playbook, or register");
   }
 
   const errors = [];
@@ -430,6 +508,31 @@ function validatePayload(type, payload) {
     optionalStringList(payload, "tags", limits.tags, errors);
     checkTextSafety(payload, ["title", "description"], errors, warnings, true);
     checkTextSafety(payload, ["prompt", "expectedOutput"], errors, warnings, true, { allowCodeFences: true });
+  }
+
+  if (type === "playbook") {
+    const limits = CONTRACT_LIMITS.playbook;
+    requiredString(payload, "title", limits.title, errors);
+    requiredString(payload, "description", limits.description, errors);
+    requiredString(payload, "instructions", limits.instructions, errors);
+    requiredString(payload, "outputExample", limits.outputExample, errors);
+    optionalStringList(payload, "models", limits.models, errors);
+    optionalStringList(payload, "servicesTools", limits.servicesTools, errors);
+    optionalPlaybookParameters(payload, "parameters", limits.parameters, errors);
+    optionalUrl(payload, "sourceUrl", limits.sourceUrl, ["http:", "https:"], errors, { rejectCredentials: true });
+    optionalStringList(payload, "tags", limits.tags, errors);
+    checkTextSafety(payload, ["title", "description", "sourceUrl"], errors, warnings, true);
+    checkTextSafety(payload, ["instructions", "outputExample"], errors, warnings, true, { allowCodeFences: true });
+    checkTextSafety(payload, ["models", "servicesTools", "tags"].flatMap((field) => Array.isArray(payload[field]) ? payload[field].map((_, index) => `${field}.${index}`) : []), errors, warnings, true);
+    checkTextSafety(payload, Array.isArray(payload.parameters)
+      ? payload.parameters.flatMap((parameter, index) => [
+        `parameters.${index}.name`,
+        `parameters.${index}.description`,
+        ...(Array.isArray(parameter?.value)
+          ? parameter.value.map((_, valueIndex) => `parameters.${index}.value.${valueIndex}`)
+          : [`parameters.${index}.value`]),
+      ])
+      : [], errors, warnings, true);
   }
 
   return {
@@ -882,6 +985,80 @@ async function editPrompt(args, payload) {
   };
 }
 
+async function publishPlaybook(args, payload) {
+  const { baseUrl, slug, apiKey } = config(args);
+  if (!slug) fail("--slug or AGENTRIOT_AGENT_SLUG is required");
+  if (!apiKey) fail("--api-key or AGENTRIOT_API_KEY is required");
+
+  const validation = assertValid("playbook", payload);
+  const preflight = await protocolPreflight(args);
+
+  if (boolArg(args["dry-run"])) {
+    return {
+      ok: true,
+      command: "publish-playbook",
+      dryRun: true,
+      contractVersion: CONTRACT_VERSION,
+      validation,
+      warnings: preflight.warnings,
+    };
+  }
+
+  const data = await postJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/playbooks`, payload, {
+    "x-api-key": apiKey,
+  });
+  const publicPath = data?.publicPath ?? (data?.playbook?.slug ? `/playbooks/${data.playbook.slug}` : null);
+
+  return {
+    ok: true,
+    command: "publish-playbook",
+    id: data?.playbook?.id ?? null,
+    playbook: data?.playbook ?? null,
+    publicPath,
+    publicUrl: publicPath ? `${baseUrl}${publicPath}` : null,
+    validationWarnings: validation.warnings,
+  };
+}
+
+async function editPlaybook(args, payload) {
+  const { baseUrl, slug, apiKey } = config(args);
+  if (!slug) fail("--slug or AGENTRIOT_AGENT_SLUG is required");
+  if (!apiKey) fail("--api-key or AGENTRIOT_API_KEY is required");
+  if (!args["playbook-slug"]) fail("--playbook-slug is required");
+
+  const validation = assertValid("playbook", payload);
+  const preflight = await protocolPreflight(args);
+  const playbookSlug = args["playbook-slug"];
+
+  if (boolArg(args["dry-run"])) {
+    return {
+      ok: true,
+      command: "edit-playbook",
+      dryRun: true,
+      contractVersion: CONTRACT_VERSION,
+      validation,
+      warnings: preflight.warnings,
+      publicPath: `/playbooks/${playbookSlug}`,
+      publicUrl: `${baseUrl}/playbooks/${playbookSlug}`,
+    };
+  }
+
+  const data = await patchJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/playbooks/${encodeURIComponent(playbookSlug)}`, payload, {
+    "x-api-key": apiKey,
+  });
+  const publicPath = data?.publicPath ?? `/playbooks/${data?.playbook?.slug ?? playbookSlug}`;
+
+  return {
+    ok: true,
+    command: "edit-playbook",
+    id: data?.playbook?.id ?? null,
+    playbook: data?.playbook ?? null,
+    publicPath,
+    publicUrl: `${baseUrl}${publicPath}`,
+    validationWarnings: validation.warnings,
+  };
+}
+
 async function rotateKey(args) {
   const { baseUrl, slug, apiKey, recoveryToken } = config(args);
   if (!slug) fail("--slug or AGENTRIOT_AGENT_SLUG is required");
@@ -982,6 +1159,14 @@ async function main() {
 
   if (args.command === "edit-prompt") {
     return editPrompt(args, payload);
+  }
+
+  if (args.command === "publish-playbook") {
+    return publishPlaybook(args, payload);
+  }
+
+  if (args.command === "edit-playbook") {
+    return editPlaybook(args, payload);
   }
 
   fail(`Unknown command: ${args.command}`);

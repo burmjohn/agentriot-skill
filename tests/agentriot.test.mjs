@@ -50,17 +50,38 @@ async function runCliFailure(args) {
   assert.fail("CLI command unexpectedly succeeded");
 }
 
+function validPlaybookPayload(overrides = {}) {
+  return {
+    title: "Daily launch review",
+    description: "A repeatable release-readiness workflow for agent operators.",
+    instructions: "Review open blockers, check telemetry, summarize launch risk, and publish the decision.",
+    outputExample: "Decision: ship. Risks: low. Follow-ups: monitor onboarding metrics.",
+    models: ["gpt-5.5"],
+    servicesTools: ["GitHub", "Playwright"],
+    parameters: [
+      {
+        name: "repository",
+        value: "owner/repo",
+        description: "Repository to inspect before launch.",
+      },
+    ],
+    sourceUrl: "https://example.com/playbooks/daily-launch-review",
+    tags: ["release", "ops"],
+    ...overrides,
+  };
+}
+
 function protocolResponse(overrides = {}) {
   return {
-    protocolVersion: "2026.05.14",
+    protocolVersion: "2026.05.16",
     skill: {
       name: "agentriot",
       recommendedVersion: "0.8.0",
       minimumVersion: "0.8.0",
     },
     contract: {
-      version: "2026.05.14",
-      minimumSupportedVersion: "2026.05.14",
+      version: "2026.05.16",
+      minimumSupportedVersion: "2026.05.16",
       limits: {},
     },
     ...overrides,
@@ -274,7 +295,7 @@ test("validate accepts a 10000 character prompt and rejects a 10001 character pr
 
   const valid = await runCli(["validate", "--type", "prompt", "--input", validPath]);
   assert.equal(valid.ok, true);
-  assert.equal(valid.contractVersion, "2026.05.14");
+  assert.equal(valid.contractVersion, "2026.05.16");
   assert.equal(valid.validation.valid, true);
   assert.equal(valid.validation.limits.prompt.prompt, 10000);
 
@@ -310,6 +331,63 @@ test("validate accepts safe prompt code fences with literal script tags", async 
   assert.equal(valid.validation.valid, true);
 });
 
+test("validate accepts playbook payloads and exposes playbook limits", async () => {
+  const inputPath = await writePayload("playbook.json", validPlaybookPayload());
+
+  const valid = await runCli(["validate", "--type", "playbook", "--input", inputPath]);
+
+  assert.equal(valid.ok, true);
+  assert.equal(valid.command, "validate");
+  assert.equal(valid.type, "playbook");
+  assert.equal(valid.contractVersion, "2026.05.16");
+  assert.equal(valid.validation.valid, true);
+  assert.equal(valid.validation.limits.playbook.instructions, 30000);
+  assert.equal(valid.validation.limits.playbook.outputExample, 5000);
+});
+
+test("validate rejects invalid playbook payloads locally", async () => {
+  const cases = [
+    ["missing title", { title: "" }, /title is required/u],
+    ["long instructions", { instructions: "i".repeat(30001) }, /instructions must be 30000 characters or fewer/u],
+    ["long output example", { outputExample: "o".repeat(5001) }, /outputExample must be 5000 characters or fewer/u],
+    ["too many models", { models: Array.from({ length: 9 }, (_, index) => `model-${index}`) }, /models must include 8 items or fewer/u],
+    ["too many services", { servicesTools: Array.from({ length: 13 }, (_, index) => `tool-${index}`) }, /servicesTools must include 12 items or fewer/u],
+    ["too many parameters", { parameters: Array.from({ length: 21 }, (_, index) => ({ name: `param-${index}` })) }, /parameters must include 20 items or fewer/u],
+    ["too many tags", { tags: ["a", "b", "c", "d", "e", "f"] }, /tags must include 5 items or fewer/u],
+    ["empty array string", { models: [""] }, /models\.0 must be a non-empty string/u],
+    ["non object parameter", { parameters: ["repository"] }, /parameters\.0 must be an object/u],
+    ["non string parameter description", { parameters: [{ name: "repository", description: 42 }] }, /parameters\.0\.description must be a string/u],
+    ["unsupported parameter value", { parameters: [{ name: "repository", value: { slug: "owner\/repo" } }] }, /parameters\.0\.value must be a string, number, boolean, or non-empty string array/u],
+    ["unsafe parameter value", { parameters: [{ name: "repository", value: "<script>alert(1)</script>" }] }, /parameters\.0\.value contains executable HTML/u],
+    ["javascript source", { sourceUrl: "javascript:alert(1)" }, /sourceUrl must use http or https URL protocol/u],
+    ["file source", { sourceUrl: "file:\/\/\/tmp\/playbook.md" }, /sourceUrl must use http or https URL protocol/u],
+    ["credentialed source", { sourceUrl: "https:\/\/user:pass@example.com\/playbook" }, /sourceUrl must not include embedded credentials/u],
+    ["encoded executable source", { sourceUrl: "https://example.com/%3Cscript%3Ealert(1)%3C/script%3E" }, /sourceUrl contains executable HTML/u],
+    ["mixed malformed encoded executable source", { sourceUrl: "https://example.com/%E0%A4%A/%3Cscript%3Ealert(1)%3C/script%3E" }, /sourceUrl contains executable HTML/u],
+    ["executable html", { description: "<script>alert(1)</script>" }, /description contains executable HTML/u],
+    ["numeric entity executable html", { description: "&#x3c;script&#x3e;alert(1)&#x3c;/script&#x3e;" }, /description contains executable HTML/u],
+    ["control junk", { instructions: "hello\u0000world" }, /instructions contains unsupported control characters/u],
+  ];
+
+  for (const [name, overrides, matcher] of cases) {
+    const inputPath = await writePayload("playbook.json", validPlaybookPayload(overrides));
+    const invalid = await runCliFailure(["validate", "--type", "playbook", "--input", inputPath]);
+    assert.equal(invalid.code, 1, name);
+    assert.match(invalid.stderr, matcher, name);
+  }
+});
+
+test("validate handles out-of-range numeric HTML entities without internal decoder errors", async () => {
+  const inputPath = await writePayload("playbook.json", validPlaybookPayload({
+    description: "Review notes with &#9999999999999999999999999999999; and &#xFFFFFFFFFFFFFFFF; markers.",
+  }));
+
+  const valid = await runCli(["validate", "--type", "playbook", "--input", inputPath]);
+
+  assert.equal(valid.ok, true);
+  assert.equal(valid.validation.valid, true);
+});
+
 test("write command dry-run validates locally and skips server mutation", async () => {
   const inputPath = await writePayload("update.json", {
     title: "Launched automated literature review pipeline",
@@ -327,8 +405,8 @@ test("write command dry-run validates locally and skips server mutation", async 
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify(protocolResponse({
       contract: {
-        version: "2026.05.15",
-        minimumSupportedVersion: "2026.05.14",
+        version: "2026.05.17",
+        minimumSupportedVersion: "2026.05.16",
         limits: {},
       },
     })));
@@ -568,6 +646,106 @@ test("edit-prompt patches an existing shared prompt", async () => {
   });
 });
 
+test("publish-playbook posts a public playbook with API key header", async () => {
+  const payload = validPlaybookPayload();
+  const inputPath = await writePayload("playbook.json", payload);
+  let seenBody = null;
+  let mutationRequests = 0;
+
+  await withServer(async (request, response) => {
+    if (request.url === "/api/agent-protocol") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(protocolResponse()));
+      return;
+    }
+
+    mutationRequests += 1;
+    assert.equal(request.method, "POST");
+    assert.equal(request.url, "/api/agents/lifecycle-agent/playbooks");
+    assert.equal(request.headers["x-api-key"], "agrt_secret_key");
+    seenBody = JSON.parse(await readRequestBody(request));
+    response.writeHead(201, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      playbook: {
+        id: "playbook_1",
+        slug: "daily-launch-review",
+        title: payload.title,
+      },
+      publicPath: "/playbooks/daily-launch-review",
+    }));
+  }, async (baseUrl) => {
+    const result = await runCli([
+      "publish-playbook",
+      "--input",
+      inputPath,
+      "--slug",
+      "lifecycle-agent",
+      "--api-key",
+      "agrt_secret_key",
+      "--base-url",
+      baseUrl,
+    ]);
+    const serialized = JSON.stringify(result);
+
+    assert.equal(result.ok, true);
+    assert.equal(result.command, "publish-playbook");
+    assert.equal(result.publicPath, "/playbooks/daily-launch-review");
+    assert.equal(result.publicUrl, `${baseUrl}/playbooks/daily-launch-review`);
+    assert.equal(result.playbook.slug, "daily-launch-review");
+    assert.deepEqual(seenBody, payload);
+    assert.equal(mutationRequests, 1);
+    assert.equal(serialized.includes("agrt_secret_key"), false);
+  });
+});
+
+test("edit-playbook patches an existing public playbook", async () => {
+  const payload = validPlaybookPayload({ title: "Updated daily launch review" });
+  const inputPath = await writePayload("playbook.json", payload);
+  let seenBody = null;
+
+  await withServer(async (request, response) => {
+    if (request.url === "/api/agent-protocol") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(protocolResponse()));
+      return;
+    }
+
+    assert.equal(request.method, "PATCH");
+    assert.equal(request.url, "/api/agents/lifecycle-agent/playbooks/daily-launch-review");
+    assert.equal(request.headers["x-api-key"], "agrt_secret_key");
+    seenBody = JSON.parse(await readRequestBody(request));
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      playbook: {
+        id: "playbook_1",
+        slug: "daily-launch-review",
+        title: payload.title,
+      },
+      publicPath: "/playbooks/daily-launch-review",
+    }));
+  }, async (baseUrl) => {
+    const result = await runCli([
+      "edit-playbook",
+      "--input",
+      inputPath,
+      "--slug",
+      "lifecycle-agent",
+      "--playbook-slug",
+      "daily-launch-review",
+      "--api-key",
+      "agrt_secret_key",
+      "--base-url",
+      baseUrl,
+    ]);
+
+    assert.equal(result.ok, true);
+    assert.equal(result.command, "edit-playbook");
+    assert.equal(result.publicPath, "/playbooks/daily-launch-review");
+    assert.equal(result.publicUrl, `${baseUrl}/playbooks/daily-launch-review`);
+    assert.deepEqual(seenBody, payload);
+  });
+});
+
 test("edit commands support dry-run validation without mutation", async () => {
   const updatePath = await writePayload("update.json", {
     title: "Updated launch note",
@@ -581,8 +759,11 @@ test("edit commands support dry-run validation without mutation", async () => {
     prompt: "Summarize the notes into findings and risks.",
     expectedOutput: "Findings and risks.",
   });
+  const playbookPath = await writePayload("playbook.json", validPlaybookPayload());
+  let requests = 0;
 
   await withServer((request, response) => {
+    requests += 1;
     assert.equal(request.url, "/api/agent-protocol");
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify(protocolResponse()));
@@ -617,11 +798,63 @@ test("edit commands support dry-run validation without mutation", async () => {
       "--base-url",
       baseUrl,
     ]);
+    const playbook = await runCli([
+      "edit-playbook",
+      "--input",
+      playbookPath,
+      "--slug",
+      "lifecycle-agent",
+      "--playbook-slug",
+      "daily-launch-review",
+      "--api-key",
+      "agrt_test_key",
+      "--dry-run",
+      "true",
+      "--base-url",
+      baseUrl,
+    ]);
 
     assert.equal(update.command, "edit-update");
     assert.equal(update.dryRun, true);
     assert.equal(prompt.command, "edit-prompt");
     assert.equal(prompt.dryRun, true);
+    assert.equal(playbook.command, "edit-playbook");
+    assert.equal(playbook.dryRun, true);
+    assert.equal(requests, 3);
+  });
+});
+
+test("publish-playbook dry-run validates and preflights without mutation", async () => {
+  const inputPath = await writePayload("playbook.json", validPlaybookPayload());
+  let requests = 0;
+
+  await withServer((request, response) => {
+    requests += 1;
+    assert.equal(request.url, "/api/agent-protocol");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(protocolResponse()));
+  }, async (baseUrl) => {
+    const result = await runCli([
+      "publish-playbook",
+      "--input",
+      inputPath,
+      "--slug",
+      "lifecycle-agent",
+      "--api-key",
+      "agrt_secret_key",
+      "--base-url",
+      baseUrl,
+      "--dry-run",
+      "true",
+    ]);
+    const serialized = JSON.stringify(result);
+
+    assert.equal(result.ok, true);
+    assert.equal(result.command, "publish-playbook");
+    assert.equal(result.dryRun, true);
+    assert.equal(result.validation.valid, true);
+    assert.equal(requests, 1);
+    assert.equal(serialized.includes("agrt_secret_key"), false);
   });
 });
 
@@ -676,6 +909,33 @@ test("public docs link to canonical AgentRiot references", async () => {
   for (const link of requiredLinks) {
     assert.ok(docs.includes(link), `missing canonical docs link: ${link}`);
   }
+});
+
+test("public docs document playbook CLI support without MCP playbook claims", async () => {
+  const root = new URL("../", import.meta.url);
+  const readme = await readFile(new URL("README.md", root), "utf8");
+  const skill = await readFile(new URL("SKILL.md", root), "utf8");
+  const docs = `${readme}\n${skill}`;
+
+  for (const phrase of [
+    "publish-playbook",
+    "edit-playbook",
+    "validate --type playbook",
+    "Playbook Payload",
+    "instructions`: 30000 characters",
+    "outputExample`: 5000 characters",
+    "24 hours",
+  ]) {
+    assert.ok(docs.includes(phrase), `missing Playbook docs phrase: ${phrase}`);
+  }
+  assert.match(docs, /does not host\s+executable files/u);
+
+  const hostedMcpSections = docs
+    .split("## Hosted MCP")
+    .slice(1)
+    .map((section) => section.split("\n## ")[0])
+    .join("\n");
+  assert.equal(/playbook/i.test(hostedMcpSections), false);
 });
 
 test("public npm commands are clearly framed as post-publish", async () => {
