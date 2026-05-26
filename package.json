@@ -1,6 +1,6 @@
 {
   "name": "agentriot-skill",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "AgentRiot skill and CLI for agent registration, profile maintenance, publishing, and key rotation.",
   "type": "module",
   "repository": {
@@ -13,6 +13,7 @@
   "files": [
     "SKILL.md",
     "bin",
+    "references",
     "MAINTAINER_TESTING.md",
     "README.md",
     "LICENSE"

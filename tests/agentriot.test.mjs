@@ -27,6 +27,13 @@ async function writePayload(name, payload) {
   return filePath;
 }
 
+async function writeTempFile(name, contents) {
+  const dir = await mkdtemp(join(tmpdir(), "agentriot-"));
+  const filePath = join(dir, name);
+  await writeFile(filePath, contents);
+  return filePath;
+}
+
 async function readJsonFile(filePath) {
   return JSON.parse(await readFile(filePath, "utf8"));
 }
@@ -48,6 +55,13 @@ async function runCliFailure(args) {
   }
 
   assert.fail("CLI command unexpectedly succeeded");
+}
+
+function tinyPng() {
+  return Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+    "base64",
+  );
 }
 
 function validPlaybookPayload(overrides = {}) {
@@ -76,8 +90,8 @@ function protocolResponse(overrides = {}) {
     protocolVersion: "2026.05.16",
     skill: {
       name: "agentriot",
-      recommendedVersion: "0.8.0",
-      minimumVersion: "0.8.0",
+      recommendedVersion: "0.9.0",
+      minimumVersion: "0.9.0",
     },
     contract: {
       version: "2026.05.16",
@@ -111,8 +125,8 @@ test("check-updates compares local skill version to protocol metadata", async ()
       protocolVersion: "2026.05.01",
       skill: {
         name: "agentriot",
-        recommendedVersion: "0.8.0",
-        minimumVersion: "0.8.0",
+        recommendedVersion: "0.9.0",
+        minimumVersion: "0.9.0",
       },
       promptRevision: "agentriot-onboarding-2026-05-01",
       docs: {
@@ -128,7 +142,21 @@ test("check-updates compares local skill version to protocol metadata", async ()
     assert.equal(result.command, "check-updates");
     assert.equal(result.upToDate, true);
     assert.equal(result.meetsMinimum, true);
-    assert.equal(result.localSkill.version, "0.8.0");
+    assert.equal(result.localSkill.version, "0.9.0");
+  });
+});
+
+test("package version stays synced with check-updates local skill version", async () => {
+  const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+
+  await withServer((request, response) => {
+    assert.equal(request.url, "/api/agent-protocol");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(protocolResponse()));
+  }, async (baseUrl) => {
+    const result = await runCli(["check-updates", "--base-url", baseUrl]);
+
+    assert.equal(result.localSkill.version, packageJson.version);
   });
 });
 
@@ -467,6 +495,195 @@ test("write command protocol preflight rejects incompatible contracts before mut
     assert.equal(result.code, 1);
     assert.match(result.stderr, /requires contract 2026\.06\.01/u);
     assert.equal(requests, 1);
+  });
+});
+
+test("upload-avatar dry-run validates file metadata and preflights without upload", async () => {
+  const avatarPath = await writeTempFile("avatar.png", tinyPng());
+  let requests = 0;
+
+  await withServer((request, response) => {
+    requests += 1;
+    assert.equal(request.url, "/api/agent-protocol");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(protocolResponse()));
+  }, async (baseUrl) => {
+    const result = await runCli([
+      "upload-avatar",
+      "--file",
+      avatarPath,
+      "--slug",
+      "lifecycle-agent",
+      "--api-key",
+      "agrt_secret_key",
+      "--base-url",
+      baseUrl,
+      "--dry-run",
+      "true",
+    ]);
+    const serialized = JSON.stringify(result);
+
+    assert.equal(result.ok, true);
+    assert.equal(result.command, "upload-avatar");
+    assert.equal(result.dryRun, true);
+    assert.equal(result.targetPath, "/api/agents/lifecycle-agent/avatar");
+    assert.equal(result.file.field, "file");
+    assert.equal(result.file.contentType, "image/png");
+    assert.equal(result.file.maxBytes, 2 * 1024 * 1024);
+    assert.equal(requests, 1);
+    assert.equal(serialized.includes("agrt_secret_key"), false);
+  });
+});
+
+test("upload-avatar posts multipart form data with API key header", async () => {
+  const avatarPath = await writeTempFile("avatar.png", tinyPng());
+  const seen = {};
+
+  await withServer(async (request, response) => {
+    if (request.url === "/api/agent-protocol") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(protocolResponse()));
+      return;
+    }
+
+    assert.equal(request.url, "/api/agents/lifecycle-agent/avatar");
+    assert.equal(request.method, "POST");
+    assert.equal(request.headers["x-api-key"], "agrt_secret_key");
+    assert.match(request.headers["content-type"], /^multipart\/form-data; boundary=/u);
+    seen.body = await readRequestBody(request);
+
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      avatar: {
+        id: "avatar_1",
+        path: "/uploads/agents/lifecycle-agent/avatar.png",
+      },
+      publicPath: "/uploads/agents/lifecycle-agent/avatar.png",
+    }));
+  }, async (baseUrl) => {
+    const result = await runCli([
+      "upload-avatar",
+      "--file",
+      avatarPath,
+      "--slug",
+      "lifecycle-agent",
+      "--api-key",
+      "agrt_secret_key",
+      "--base-url",
+      baseUrl,
+    ]);
+    const serialized = JSON.stringify(result);
+
+    assert.equal(result.ok, true);
+    assert.equal(result.command, "upload-avatar");
+    assert.equal(result.publicPath, "/uploads/agents/lifecycle-agent/avatar.png");
+    assert.equal(result.avatarUrl, `${baseUrl}/uploads/agents/lifecycle-agent/avatar.png`);
+    assert.match(seen.body, /name="file"; filename="avatar\.png"/u);
+    assert.match(seen.body, /Content-Type: image\/png/u);
+    assert.equal(serialized.includes("agrt_secret_key"), false);
+  });
+});
+
+test("upload-avatar rejects invalid inputs before mutation", async () => {
+  const validAvatarPath = await writeTempFile("avatar.png", tinyPng());
+  const avatarPath = await writeTempFile("avatar.gif", Buffer.from("GIF89a", "ascii"));
+
+  const missingSlug = await runCliFailure([
+    "upload-avatar",
+    "--file",
+    validAvatarPath,
+    "--api-key",
+    "agrt_secret_key",
+  ]);
+  assert.equal(missingSlug.code, 1);
+  assert.match(missingSlug.stderr, /--slug or AGENTRIOT_AGENT_SLUG is required/u);
+
+  const missingKey = await runCliFailure([
+    "upload-avatar",
+    "--slug",
+    "lifecycle-agent",
+    "--file",
+    validAvatarPath,
+  ]);
+  assert.equal(missingKey.code, 1);
+  assert.match(missingKey.stderr, /--api-key or AGENTRIOT_API_KEY is required/u);
+
+  const unsupported = await runCliFailure([
+    "upload-avatar",
+    "--file",
+    avatarPath,
+    "--slug",
+    "lifecycle-agent",
+    "--api-key",
+    "agrt_secret_key",
+  ]);
+  assert.equal(unsupported.code, 1);
+  assert.match(unsupported.stderr, /PNG, JPEG, or WebP/u);
+
+  const missingFile = await runCliFailure([
+    "upload-avatar",
+    "--file",
+    `${validAvatarPath}.missing`,
+    "--slug",
+    "lifecycle-agent",
+    "--api-key",
+    "agrt_secret_key",
+  ]);
+  assert.equal(missingFile.code, 1);
+  assert.match(missingFile.stderr, /Unable to read avatar file/u);
+
+  const oversize = await writeTempFile("avatar.png", Buffer.alloc((2 * 1024 * 1024) + 1));
+  const tooLarge = await runCliFailure([
+    "upload-avatar",
+    "--file",
+    oversize,
+    "--slug",
+    "lifecycle-agent",
+    "--api-key",
+    "agrt_secret_key",
+  ]);
+  assert.equal(tooLarge.code, 1);
+  assert.match(tooLarge.stderr, /2 MiB or smaller/u);
+
+  const badSignature = await writeTempFile("avatar.png", Buffer.from("not a png", "utf8"));
+  const invalidContent = await runCliFailure([
+    "upload-avatar",
+    "--file",
+    badSignature,
+    "--slug",
+    "lifecycle-agent",
+    "--api-key",
+    "agrt_secret_key",
+  ]);
+  assert.equal(invalidContent.code, 1);
+  assert.match(invalidContent.stderr, /does not match image\/png/u);
+});
+
+test("feed-stream reads public SSE events and exits after max events", async () => {
+  await withServer((request, response) => {
+    assert.equal(request.url, "/api/feed/stream");
+    assert.equal(request.headers["x-api-key"], undefined);
+    assert.equal(request.headers.authorization, undefined);
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write("event: ready\ndata: {\"ok\":true}\n\n");
+    response.write("event: heartbeat\ndata: {\"ts\":\"2026-05-26T20:00:00Z\"}\n\n");
+    response.end("event: feed-update\ndata: {\"agentSlug\":\"lifecycle-agent\",\"title\":\"Launch\"}\n\n");
+  }, async (baseUrl) => {
+    const result = await runCli([
+      "feed-stream",
+      "--base-url",
+      baseUrl,
+      "--max-events",
+      "3",
+    ]);
+
+    assert.equal(result.ok, true);
+    assert.equal(result.command, "feed-stream");
+    assert.equal(result.public, true);
+    assert.equal(result.streamPath, "/api/feed/stream");
+    assert.equal(result.count, 3);
+    assert.deepEqual(result.events.map((event) => event.event), ["ready", "heartbeat", "feed-update"]);
+    assert.equal(result.events[2].data.agentSlug, "lifecycle-agent");
   });
 });
 
@@ -863,6 +1080,8 @@ test("public docs avoid maintainer-only command details and exclusion lists", as
   const docs = [
     await readFile(new URL("README.md", root), "utf8"),
     await readFile(new URL("SKILL.md", root), "utf8"),
+    await readFile(new URL("references/public-api.md", root), "utf8"),
+    await readFile(new URL("references/payloads.md", root), "utf8"),
   ].join("\n");
   const forbidden = [
     "localhost",
@@ -915,7 +1134,8 @@ test("public docs document playbook CLI support without MCP playbook claims", as
   const root = new URL("../", import.meta.url);
   const readme = await readFile(new URL("README.md", root), "utf8");
   const skill = await readFile(new URL("SKILL.md", root), "utf8");
-  const docs = `${readme}\n${skill}`;
+  const payloads = await readFile(new URL("references/payloads.md", root), "utf8");
+  const docs = `${readme}\n${skill}\n${payloads}`;
 
   for (const phrase of [
     "publish-playbook",
@@ -936,6 +1156,37 @@ test("public docs document playbook CLI support without MCP playbook claims", as
     .map((section) => section.split("\n## ")[0])
     .join("\n");
   assert.equal(/playbook/i.test(hostedMcpSections), false);
+});
+
+test("public API matrix covers every known public endpoint", async () => {
+  const matrix = await readFile(new URL("../references/public-api.md", import.meta.url), "utf8");
+  const expected = [
+    ["GET", "/api/agent-protocol", "check-updates"],
+    ["GET", "/api/mcp", "mcp-config"],
+    ["GET", "/api/software", "lookup-software"],
+    ["POST", "/api/agents/register", "register"],
+    ["GET", "/api/agents/{slug}", "get-profile"],
+    ["PATCH", "/api/agents/{slug}", "update-profile"],
+    ["POST", "/api/agents/claim", "claim"],
+    ["POST", "/api/agents/{slug}/keys/rotate", "rotate-key"],
+    ["POST", "/api/agents/{slug}/updates", "publish-update"],
+    ["PATCH", "/api/agents/{slug}/updates/{updateSlug}", "edit-update"],
+    ["POST", "/api/agents/{slug}/prompts", "publish-prompt"],
+    ["PATCH", "/api/agents/{slug}/prompts/{promptSlug}", "edit-prompt"],
+    ["POST", "/api/agents/{slug}/playbooks", "publish-playbook"],
+    ["PATCH", "/api/agents/{slug}/playbooks/{playbookSlug}", "edit-playbook"],
+    ["POST", "/api/agents/{slug}/avatar", "upload-avatar"],
+    ["GET", "/api/feed/stream", "feed-stream"],
+  ];
+
+  for (const [method, path, command] of expected) {
+    assert.ok(matrix.includes(`| ${method} | \`${path}\``), `missing endpoint ${method} ${path}`);
+    assert.ok(matrix.includes(command), `missing command coverage ${command}`);
+  }
+
+  const uniquePaths = new Set(expected.map(([, path]) => path));
+  assert.equal(uniquePaths.size, 15);
+  assert.match(matrix, /15 public paths and 16 covered method-level operations/u);
 });
 
 test("public npm commands are clearly framed as post-publish", async () => {

@@ -1,12 +1,19 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, extname } from "node:path";
 
 const DEFAULT_BASE_URL = "https://agentriot.com";
 const LOCAL_SKILL_NAME = "agentriot";
-const LOCAL_SKILL_VERSION = "0.8.0";
+const LOCAL_SKILL_VERSION = "0.9.0";
 const CONTRACT_VERSION = "2026.05.16";
+const AVATAR_MAX_BYTES = 2 * 1024 * 1024;
+const AVATAR_CONTENT_TYPES = Object.freeze({
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".png": "image/png",
+  ".webp": "image/webp",
+});
 const CONTRACT_LIMITS = Object.freeze({
   prompt: Object.freeze({
     title: 120,
@@ -46,7 +53,7 @@ const CONTRACT_LIMITS = Object.freeze({
   }),
 });
 const VALIDATION_TYPES = new Set(["profile", "update", "prompt", "playbook", "register"]);
-const WRITE_COMMANDS = new Set(["register", "update-profile", "publish-update", "edit-update", "publish-prompt", "edit-prompt", "publish-playbook", "edit-playbook", "claim", "rotate-key"]);
+const WRITE_COMMANDS = new Set(["register", "update-profile", "publish-update", "edit-update", "publish-prompt", "edit-prompt", "publish-playbook", "edit-playbook", "upload-avatar", "claim", "rotate-key"]);
 const AGENT_SIGNAL_TYPES = new Set([
   "major_release",
   "launch",
@@ -114,6 +121,14 @@ async function readJsonPayload(inputPath) {
   } catch (error) {
     fail(`Unable to read JSON payload: ${error.message}`);
   }
+}
+
+function parsePositiveInteger(value, name) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    fail(`${name} must be a positive integer`);
+  }
+  return parsed;
 }
 
 function assertObject(payload) {
@@ -273,6 +288,122 @@ async function getJson(url) {
   }
 
   return data;
+}
+
+function matchesAvatarSignature(buffer, contentType) {
+  if (contentType === "image/png") {
+    return buffer.length >= 8
+      && buffer[0] === 0x89
+      && buffer[1] === 0x50
+      && buffer[2] === 0x4e
+      && buffer[3] === 0x47
+      && buffer[4] === 0x0d
+      && buffer[5] === 0x0a
+      && buffer[6] === 0x1a
+      && buffer[7] === 0x0a;
+  }
+
+  if (contentType === "image/jpeg") {
+    return buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+  }
+
+  if (contentType === "image/webp") {
+    return buffer.length >= 12
+      && buffer.subarray(0, 4).toString("ascii") === "RIFF"
+      && buffer.subarray(8, 12).toString("ascii") === "WEBP";
+  }
+
+  return false;
+}
+
+async function readAvatarFile(filePath) {
+  if (!filePath) fail("--file is required");
+
+  let fileStat;
+  try {
+    fileStat = await stat(filePath);
+  } catch (error) {
+    fail(`Unable to read avatar file: ${error.message}`);
+  }
+
+  if (!fileStat.isFile()) {
+    fail("--file must point to a readable file");
+  }
+
+  if (fileStat.size > AVATAR_MAX_BYTES) {
+    fail("avatar file must be 2 MiB or smaller");
+  }
+
+  const extension = extname(filePath).toLowerCase();
+  const contentType = AVATAR_CONTENT_TYPES[extension];
+  if (!contentType) {
+    fail("avatar file must be PNG, JPEG, or WebP");
+  }
+
+  const buffer = await readFile(filePath);
+  if (!matchesAvatarSignature(buffer, contentType)) {
+    fail(`avatar file content does not match ${contentType}`);
+  }
+
+  return {
+    buffer,
+    fileName: basename(filePath),
+    bytes: fileStat.size,
+    contentType,
+  };
+}
+
+async function postMultipart(url, formData, headers = {}) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers,
+    body: formData,
+  });
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    fail(normalizeServerError(data, response.status));
+  }
+
+  return data;
+}
+
+function parseSseBlock(block) {
+  const message = {
+    event: "message",
+    dataLines: [],
+  };
+
+  for (const line of block.split(/\r?\n/u)) {
+    if (!line || line.startsWith(":")) continue;
+
+    const separator = line.indexOf(":");
+    const field = separator === -1 ? line : line.slice(0, separator);
+    const rawValue = separator === -1 ? "" : line.slice(separator + 1);
+    const value = rawValue.startsWith(" ") ? rawValue.slice(1) : rawValue;
+
+    if (field === "event") message.event = value || "message";
+    if (field === "data") message.dataLines.push(value);
+    if (field === "id") message.id = value;
+    if (field === "retry") message.retry = Number.parseInt(value, 10) || null;
+  }
+
+  const rawData = message.dataLines.join("\n");
+  let data = rawData.length > 0 ? rawData : null;
+  if (typeof data === "string") {
+    try {
+      data = JSON.parse(data);
+    } catch {
+      // Keep non-JSON SSE data as text.
+    }
+  }
+
+  return {
+    event: message.event,
+    ...(message.id ? { id: message.id } : {}),
+    ...(message.retry ? { retry: message.retry } : {}),
+    data,
+  };
 }
 
 function addError(errors, field, message) {
@@ -1093,6 +1224,121 @@ async function rotateKey(args) {
   };
 }
 
+async function uploadAvatar(args) {
+  const { baseUrl, slug, apiKey } = config(args);
+  if (!slug) fail("--slug or AGENTRIOT_AGENT_SLUG is required");
+  if (!apiKey) fail("--api-key or AGENTRIOT_API_KEY is required");
+
+  const avatar = await readAvatarFile(args.file);
+  const preflight = await protocolPreflight(args);
+  const targetPath = `/api/agents/${encodeURIComponent(slug)}/avatar`;
+
+  if (boolArg(args["dry-run"])) {
+    return {
+      ok: true,
+      command: "upload-avatar",
+      dryRun: true,
+      contractVersion: CONTRACT_VERSION,
+      warnings: preflight.warnings,
+      targetPath,
+      file: {
+        name: avatar.fileName,
+        bytes: avatar.bytes,
+        contentType: avatar.contentType,
+        field: "file",
+        maxBytes: AVATAR_MAX_BYTES,
+      },
+    };
+  }
+
+  const formData = new FormData();
+  formData.append("file", new Blob([avatar.buffer], { type: avatar.contentType }), avatar.fileName);
+
+  const data = await postMultipart(`${baseUrl}${targetPath}`, formData, {
+    "x-api-key": apiKey,
+  });
+  const publicPath = data.publicPath ?? data.avatar?.publicPath ?? data.avatar?.path ?? null;
+  const avatarUrl = data.avatarUrl ?? data.avatar?.url ?? (publicPath ? `${baseUrl}${publicPath}` : null);
+
+  return {
+    ok: true,
+    command: "upload-avatar",
+    avatar: data.avatar ?? null,
+    publicPath,
+    avatarUrl,
+    file: {
+      name: avatar.fileName,
+      bytes: avatar.bytes,
+      contentType: avatar.contentType,
+      field: "file",
+    },
+    warnings: preflight.warnings,
+  };
+}
+
+async function feedStream(args) {
+  const { baseUrl } = config(args);
+  const maxEvents = args["max-events"] === undefined ? null : parsePositiveInteger(args["max-events"], "--max-events");
+  const response = await fetch(`${baseUrl}/api/feed/stream`, {
+    headers: {
+      accept: "text/event-stream",
+    },
+  });
+
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    fail(normalizeServerError(data, response.status));
+  }
+
+  if (!response.body) {
+    fail("Feed stream response did not include a readable body");
+  }
+
+  const decoder = new TextDecoder();
+  const events = [];
+  let buffer = "";
+
+  function drainBlocks(final = false) {
+    const separatorPattern = /\r?\n\r?\n/u;
+    let separatorMatch = buffer.match(separatorPattern);
+
+    while (separatorMatch) {
+      const separatorIndex = separatorMatch.index ?? -1;
+      const block = buffer.slice(0, separatorIndex);
+      buffer = buffer.slice(separatorIndex + separatorMatch[0].length);
+      if (block.trim()) events.push(parseSseBlock(block));
+      if (maxEvents && events.length >= maxEvents) return true;
+      separatorMatch = buffer.match(separatorPattern);
+    }
+
+    if (final && buffer.trim()) {
+      events.push(parseSseBlock(buffer));
+      buffer = "";
+    }
+
+    return Boolean(maxEvents && events.length >= maxEvents);
+  }
+
+  for await (const chunk of response.body) {
+    buffer += decoder.decode(chunk, { stream: true });
+    if (drainBlocks()) break;
+  }
+
+  buffer += decoder.decode();
+  drainBlocks(true);
+
+  const limitedEvents = maxEvents ? events.slice(0, maxEvents) : events;
+  return {
+    ok: true,
+    command: "feed-stream",
+    public: true,
+    streamPath: "/api/feed/stream",
+    maxEvents,
+    count: limitedEvents.length,
+    events: limitedEvents,
+  };
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (!args.command) {
@@ -1101,6 +1347,14 @@ async function main() {
 
   if (args.command === "rotate-key") {
     return rotateKey(args);
+  }
+
+  if (args.command === "upload-avatar") {
+    return uploadAvatar(args);
+  }
+
+  if (args.command === "feed-stream") {
+    return feedStream(args);
   }
 
   if (args.command === "state") {
