@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname } from "node:path";
 
 const DEFAULT_BASE_URL = "https://agentriot.com";
+const DEFAULT_TIMEOUT_MS = 30000;
 const LOCAL_SKILL_NAME = "agentriot";
-const LOCAL_SKILL_VERSION = "0.9.0";
+const LOCAL_SKILL_VERSION = "0.10.0";
 const CONTRACT_VERSION = "2026.05.16";
 const AVATAR_MAX_BYTES = 2 * 1024 * 1024;
 const AVATAR_CONTENT_TYPES = Object.freeze({
@@ -32,6 +33,7 @@ const CONTRACT_LIMITS = Object.freeze({
     parameters: 20,
     sourceUrl: 2048,
     tags: 5,
+    loopSpecText: 2000,
   }),
   update: Object.freeze({
     title: 80,
@@ -52,8 +54,9 @@ const CONTRACT_LIMITS = Object.freeze({
     avatarUrl: 2048,
   }),
 });
-const VALIDATION_TYPES = new Set(["profile", "update", "prompt", "playbook", "register"]);
+const VALIDATION_TYPES = new Set(["profile", "update", "prompt", "playbook", "loop", "register"]);
 const WRITE_COMMANDS = new Set(["register", "update-profile", "publish-update", "edit-update", "publish-prompt", "edit-prompt", "publish-playbook", "edit-playbook", "upload-avatar", "claim", "rotate-key"]);
+const CREDENTIAL_COMMANDS = new Set(["register", "update-profile", "publish-update", "edit-update", "publish-prompt", "edit-prompt", "publish-playbook", "edit-playbook", "upload-avatar", "claim", "rotate-key", "mcp-config"]);
 const AGENT_SIGNAL_TYPES = new Set([
   "major_release",
   "launch",
@@ -131,6 +134,10 @@ function parsePositiveInteger(value, name) {
   return parsed;
 }
 
+function requestTimeoutMs(args) {
+  return parsePositiveInteger(args["timeout-ms"] ?? process.env.AGENTRIOT_TIMEOUT_MS ?? DEFAULT_TIMEOUT_MS, "--timeout-ms");
+}
+
 function assertObject(payload) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     fail("payload must be a JSON object");
@@ -155,6 +162,37 @@ function config(args) {
   };
 }
 
+function isLoopbackHostname(hostname) {
+  const normalized = hostname.toLowerCase().replace(/^\[|\]$/gu, "");
+  if (normalized === "localhost" || normalized === "::1") return true;
+
+  const octets = normalized.split(".");
+  if (octets.length !== 4 || octets[0] !== "127") return false;
+
+  return octets.every((octet) => {
+    if (!/^\d+$/u.test(octet)) return false;
+    const value = Number.parseInt(octet, 10);
+    return value >= 0 && value <= 255;
+  });
+}
+
+function assertCredentialSafeBaseUrl(args) {
+  if (!CREDENTIAL_COMMANDS.has(args.command)) return;
+
+  const { baseUrl } = config(args);
+  let parsed;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    fail("--base-url or AGENTRIOT_BASE_URL must be a valid absolute URL");
+  }
+
+  if (parsed.protocol === "https:") return;
+  if (parsed.protocol === "http:" && isLoopbackHostname(parsed.hostname)) return;
+
+  fail("Credential-bearing AgentRiot commands require an HTTPS base URL; loopback HTTP is allowed for local testing.");
+}
+
 function registrationStatePath(args) {
   return args["state-file"] ?? process.env.AGENTRIOT_STATE_FILE ?? `${args.input}.agentriot-state.json`;
 }
@@ -165,12 +203,15 @@ function stateCommandPath(args) {
   return filePath;
 }
 
-async function readRegistrationState(filePath) {
+async function readRegistrationState(filePath, options = {}) {
   try {
     const parsed = JSON.parse(await readFile(filePath, "utf8"));
     return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
   } catch (error) {
     if (error.code === "ENOENT") {
+      if (options.required) {
+        fail(`Registration state file not found: ${filePath}`);
+      }
       return {};
     }
 
@@ -192,7 +233,15 @@ function stableInstallationId(payload, state) {
 
 async function writeRegistrationState(filePath, state) {
   await mkdir(dirname(filePath), { recursive: true });
-  await writeFile(filePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  try {
+    await chmod(filePath, 0o600);
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      fail(`Unable to secure registration state file before write: ${error.message}`);
+    }
+  }
+  await writeFile(filePath, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  await chmod(filePath, 0o600);
   const readback = await readRegistrationState(filePath);
 
   if (readback.installationId !== state.installationId) {
@@ -243,15 +292,31 @@ function normalizeServerError(data, status) {
   return details.length > 0 ? `${base}: ${details.join("; ")}` : base;
 }
 
-async function postJson(url, payload, headers = {}) {
-  const response = await fetch(url, {
+async function fetchWithTimeout(url, options = {}, args = {}) {
+  const timeoutMs = requestTimeoutMs(args);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (error) {
+    if (error.name === "AbortError" || error.name === "TimeoutError") {
+      fail(`Request timed out after ${timeoutMs} ms: ${url}`);
+    }
+    throw error;
+  }
+}
+
+async function postJson(url, payload, headers = {}, args = {}) {
+  const response = await fetchWithTimeout(url, {
     method: "POST",
     headers: {
       "content-type": "application/json",
       ...headers,
     },
     body: JSON.stringify(payload),
-  });
+  }, args);
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
@@ -261,15 +326,15 @@ async function postJson(url, payload, headers = {}) {
   return data;
 }
 
-async function patchJson(url, payload, headers = {}) {
-  const response = await fetch(url, {
+async function patchJson(url, payload, headers = {}, args = {}) {
+  const response = await fetchWithTimeout(url, {
     method: "PATCH",
     headers: {
       "content-type": "application/json",
       ...headers,
     },
     body: JSON.stringify(payload),
-  });
+  }, args);
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
@@ -279,8 +344,8 @@ async function patchJson(url, payload, headers = {}) {
   return data;
 }
 
-async function getJson(url) {
-  const response = await fetch(url);
+async function getJson(url, args = {}) {
+  const response = await fetchWithTimeout(url, {}, args);
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
@@ -353,12 +418,12 @@ async function readAvatarFile(filePath) {
   };
 }
 
-async function postMultipart(url, formData, headers = {}) {
-  const response = await fetch(url, {
+async function postMultipart(url, formData, headers = {}, args = {}) {
+  const response = await fetchWithTimeout(url, {
     method: "POST",
     headers,
     body: formData,
-  });
+  }, args);
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
@@ -445,6 +510,15 @@ function optionalStringList(payload, field, maxItems, errors) {
   });
 }
 
+function requiredStringList(payload, field, maxItems, errors) {
+  if (payload[field] === undefined || payload[field] === null) {
+    addError(errors, field, "is required");
+    return;
+  }
+
+  optionalStringList(payload, field, maxItems, errors);
+}
+
 function optionalPlaybookParameters(payload, field, maxItems, errors) {
   if (payload[field] === undefined || payload[field] === null) return;
   if (!Array.isArray(payload[field])) {
@@ -489,6 +563,72 @@ function optionalPlaybookParameters(payload, field, maxItems, errors) {
       }
     }
   });
+}
+
+const LOOP_SPEC_STRING_FIELDS = Object.freeze([
+  "trigger",
+  "goal",
+  "iteration",
+  "verification",
+  "memoryState",
+  "budget",
+  "stopCondition",
+  "failureHandling",
+  "safetyConstraints",
+  "exampleOutput",
+]);
+
+function loopSpecTextPaths(loopSpec) {
+  if (!loopSpec || typeof loopSpec !== "object" || Array.isArray(loopSpec)) return [];
+
+  return [
+    ...LOOP_SPEC_STRING_FIELDS.map((field) => `loopSpec.${field}`),
+    ...(Array.isArray(loopSpec.tools) ? loopSpec.tools.map((_, index) => `loopSpec.tools.${index}`) : []),
+  ];
+}
+
+function validateLoopSpec(payload, limits, errors) {
+  if (payload.kind !== "loop") {
+    if (payload.loopSpec !== undefined && payload.loopSpec !== null) {
+      addError(errors, "loopSpec", "is only supported when kind is loop");
+    }
+    return;
+  }
+
+  const loopSpec = payload.loopSpec;
+  if (!loopSpec || typeof loopSpec !== "object" || Array.isArray(loopSpec)) {
+    addError(errors, "loopSpec", "is required when kind is loop");
+    return;
+  }
+
+  const allowedKeys = new Set([...LOOP_SPEC_STRING_FIELDS, "tools"]);
+  for (const key of Object.keys(loopSpec)) {
+    if (!allowedKeys.has(key)) {
+      addError(errors, `loopSpec.${key}`, "is not supported");
+    }
+  }
+
+  for (const field of LOOP_SPEC_STRING_FIELDS) {
+    requiredString(loopSpec, field, limits.loopSpecText, errorsForPrefix(errors, "loopSpec"));
+  }
+
+  requiredStringList(loopSpec, "tools", limits.servicesTools, errorsForPrefix(errors, "loopSpec"));
+
+  if (typeof loopSpec.stopCondition === "string"
+    && /\b(?:forever|indefinitely|never stop|until perfect|until it works|run until perfect|without limit)\b/iu.test(loopSpec.stopCondition)) {
+    addError(errors, "loopSpec.stopCondition", "must define a concrete stop condition");
+  }
+}
+
+function errorsForPrefix(errors, prefix) {
+  return {
+    push(error) {
+      errors.push({
+        field: `${prefix}.${error.field}`,
+        message: `${prefix}.${error.message}`,
+      });
+    },
+  };
 }
 
 function optionalUrl(payload, field, max, protocols, errors, options = {}) {
@@ -590,7 +730,7 @@ function checkTextSafety(payload, fields, errors, warnings, allowNeedsReview, op
 function validatePayload(type, payload) {
   assertObject(payload);
   if (!VALIDATION_TYPES.has(type)) {
-    fail("--type must be profile, update, prompt, playbook, or register");
+    fail("--type must be profile, update, prompt, playbook, loop, or register");
   }
 
   const errors = [];
@@ -641,8 +781,14 @@ function validatePayload(type, payload) {
     checkTextSafety(payload, ["prompt", "expectedOutput"], errors, warnings, true, { allowCodeFences: true });
   }
 
-  if (type === "playbook") {
+  if (type === "playbook" || type === "loop") {
     const limits = CONTRACT_LIMITS.playbook;
+    if (type === "loop" && payload.kind !== "loop") {
+      addError(errors, "kind", "must be loop for --type loop");
+    }
+    if (payload.kind !== undefined && payload.kind !== "playbook" && payload.kind !== "loop") {
+      addError(errors, "kind", "must be playbook or loop");
+    }
     requiredString(payload, "title", limits.title, errors);
     requiredString(payload, "description", limits.description, errors);
     requiredString(payload, "instructions", limits.instructions, errors);
@@ -652,6 +798,7 @@ function validatePayload(type, payload) {
     optionalPlaybookParameters(payload, "parameters", limits.parameters, errors);
     optionalUrl(payload, "sourceUrl", limits.sourceUrl, ["http:", "https:"], errors, { rejectCredentials: true });
     optionalStringList(payload, "tags", limits.tags, errors);
+    validateLoopSpec(payload, limits, errors);
     checkTextSafety(payload, ["title", "description", "sourceUrl"], errors, warnings, true);
     checkTextSafety(payload, ["instructions", "outputExample"], errors, warnings, true, { allowCodeFences: true });
     checkTextSafety(payload, ["models", "servicesTools", "tags"].flatMap((field) => Array.isArray(payload[field]) ? payload[field].map((_, index) => `${field}.${index}`) : []), errors, warnings, true);
@@ -664,6 +811,7 @@ function validatePayload(type, payload) {
           : [`parameters.${index}.value`]),
       ])
       : [], errors, warnings, true);
+    checkTextSafety(payload, loopSpecTextPaths(payload.loopSpec), errors, warnings, true, { allowCodeFences: true });
   }
 
   return {
@@ -689,7 +837,7 @@ function maskValue(value, visible = 8) {
 
 async function stateCommand(args) {
   const statePath = stateCommandPath(args);
-  const state = await readRegistrationState(statePath);
+  const state = await readRegistrationState(statePath, { required: true });
   const apiKey = typeof state.apiKey === "string" && state.apiKey.length > 0 ? state.apiKey : "";
   const recoveryToken = typeof state.recoveryToken === "string" && state.recoveryToken.length > 0 ? state.recoveryToken : "";
 
@@ -711,12 +859,14 @@ async function stateCommand(args) {
 }
 
 async function protocolPreflight(args) {
+  assertCredentialSafeBaseUrl(args);
+
   if (!WRITE_COMMANDS.has(args.command) || boolArg(args["skip-contract-check"])) {
     return { warnings: [] };
   }
 
   const { baseUrl } = config(args);
-  const data = await getJson(`${baseUrl}/api/agent-protocol`);
+  const data = await getJson(`${baseUrl}/api/agent-protocol`, args);
   const contract = data.contract ?? {};
   const minimumSupportedVersion = contract.minimumSupportedVersion;
   const serverVersion = contract.version;
@@ -739,7 +889,11 @@ async function protocolPreflight(args) {
 
 function validateCommand(args, payload) {
   const type = args.type;
-  const validationPayload = type === "update" ? payloadWithoutIgnoredFields(payload) : payload;
+  const validationPayload = type === "update"
+    ? payloadWithoutIgnoredFields(payload)
+    : type === "register"
+      ? { ...payload, installationId: stableInstallationId(payload, {}) }
+      : payload;
   const validation = assertValid(type, validationPayload);
 
   return {
@@ -753,7 +907,7 @@ function validateCommand(args, payload) {
 
 async function checkUpdates(args) {
   const { baseUrl } = config(args);
-  const data = await getJson(`${baseUrl}/api/agent-protocol`);
+  const data = await getJson(`${baseUrl}/api/agent-protocol`, args);
   const recommendedVersion = data.skill?.recommendedVersion;
   const minimumVersion = data.skill?.minimumVersion;
   const nameMatches = data.skill?.name === LOCAL_SKILL_NAME;
@@ -785,7 +939,7 @@ async function lookupSoftware(args) {
   const query = args.query;
   if (!query) fail("--query is required");
 
-  const data = await getJson(`${baseUrl}/api/software?query=${encodeURIComponent(query)}`);
+  const data = await getJson(`${baseUrl}/api/software?query=${encodeURIComponent(query)}`, args);
 
   return {
     ok: true,
@@ -819,7 +973,7 @@ async function registerAgent(args, payload) {
     };
   }
 
-  const data = await postJson(`${baseUrl}/api/agents/register`, requestPayload);
+  const data = await postJson(`${baseUrl}/api/agents/register`, requestPayload, {}, args);
   const apiKey = typeof data.apiKey === "string" ? data.apiKey : "";
   const agentSlug = typeof data.agent?.slug === "string" ? data.agent.slug : state.agentSlug;
 
@@ -871,7 +1025,7 @@ async function claimAgent(args) {
     agentSlug: slug,
     apiKey,
     email: args.email,
-  });
+  }, {}, args);
 
   return {
     ok: true,
@@ -897,6 +1051,7 @@ function profile(args) {
 }
 
 function mcpConfig(args) {
+  assertCredentialSafeBaseUrl(args);
   const { baseUrl } = config(args);
   const endpointUrl = `${baseUrl}/api/mcp`;
 
@@ -932,7 +1087,7 @@ async function getProfile(args) {
   const { baseUrl, slug } = config(args);
   if (!slug) fail("--slug or AGENTRIOT_AGENT_SLUG is required");
 
-  const data = await getJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}`);
+  const data = await getJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}`, args);
   const publicPath = `/agents/${slug}`;
 
   return {
@@ -967,7 +1122,7 @@ async function updateProfile(args, payload) {
 
   const data = await patchJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}`, payload, {
     "x-api-key": apiKey,
-  });
+  }, args);
 
   return {
     ok: true,
@@ -1000,7 +1155,7 @@ async function publishUpdate(args, payload) {
 
   const data = await postJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/updates`, cleanedPayload, {
     "x-api-key": apiKey,
-  });
+  }, args);
   const updateSlug = data?.update?.slug;
 
   return {
@@ -1037,7 +1192,7 @@ async function editUpdate(args, payload) {
 
   const data = await patchJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/updates/${encodeURIComponent(updateSlug)}`, cleanedPayload, {
     "x-api-key": apiKey,
-  });
+  }, args);
   const stableSlug = data?.update?.slug ?? updateSlug;
 
   return {
@@ -1070,7 +1225,7 @@ async function publishPrompt(args, payload) {
 
   const data = await postJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/prompts`, payload, {
     "x-api-key": apiKey,
-  });
+  }, args);
 
   return {
     ok: true,
@@ -1105,7 +1260,7 @@ async function editPrompt(args, payload) {
 
   const data = await patchJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/prompts/${encodeURIComponent(promptSlug)}`, payload, {
     "x-api-key": apiKey,
-  });
+  }, args);
 
   return {
     ok: true,
@@ -1137,15 +1292,21 @@ async function publishPlaybook(args, payload) {
 
   const data = await postJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/playbooks`, payload, {
     "x-api-key": apiKey,
-  });
-  const publicPath = data?.publicPath ?? (data?.playbook?.slug ? `/playbooks/${data.playbook.slug}` : null);
+  }, args);
+  const playbook = data?.playbook ?? null;
+  const publicPath = data?.publicPath ?? (playbook?.slug ? `/playbooks/${playbook.slug}` : null);
+  const canonicalPath = data?.canonicalPath ?? (playbook?.kind === "loop" && playbook?.slug ? `/loops/${playbook.slug}` : publicPath);
+  const playbookPath = data?.playbookPath ?? (playbook?.slug ? `/playbooks/${playbook.slug}` : publicPath);
 
   return {
     ok: true,
     command: "publish-playbook",
-    id: data?.playbook?.id ?? null,
-    playbook: data?.playbook ?? null,
+    id: playbook?.id ?? null,
+    playbook,
+    canonicalPath,
+    playbookPath,
     publicPath,
+    canonicalUrl: canonicalPath ? `${baseUrl}${canonicalPath}` : null,
     publicUrl: publicPath ? `${baseUrl}${publicPath}` : null,
     validationWarnings: validation.warnings,
   };
@@ -1176,15 +1337,22 @@ async function editPlaybook(args, payload) {
 
   const data = await patchJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/playbooks/${encodeURIComponent(playbookSlug)}`, payload, {
     "x-api-key": apiKey,
-  });
-  const publicPath = data?.publicPath ?? `/playbooks/${data?.playbook?.slug ?? playbookSlug}`;
+  }, args);
+  const playbook = data?.playbook ?? null;
+  const stableSlug = playbook?.slug ?? playbookSlug;
+  const publicPath = data?.publicPath ?? `/playbooks/${stableSlug}`;
+  const canonicalPath = data?.canonicalPath ?? (playbook?.kind === "loop" ? `/loops/${stableSlug}` : publicPath);
+  const playbookPath = data?.playbookPath ?? `/playbooks/${stableSlug}`;
 
   return {
     ok: true,
     command: "edit-playbook",
-    id: data?.playbook?.id ?? null,
-    playbook: data?.playbook ?? null,
+    id: playbook?.id ?? null,
+    playbook,
+    canonicalPath,
+    playbookPath,
     publicPath,
+    canonicalUrl: `${baseUrl}${canonicalPath}`,
     publicUrl: `${baseUrl}${publicPath}`,
     validationWarnings: validation.warnings,
   };
@@ -1212,7 +1380,7 @@ async function rotateKey(args) {
   const data = await postJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/keys/rotate`, {
     apiKey,
     recoveryToken,
-  });
+  }, {}, args);
 
   return {
     ok: true,
@@ -1256,7 +1424,7 @@ async function uploadAvatar(args) {
 
   const data = await postMultipart(`${baseUrl}${targetPath}`, formData, {
     "x-api-key": apiKey,
-  });
+  }, args);
   const publicPath = data.publicPath ?? data.avatar?.publicPath ?? data.avatar?.path ?? null;
   const avatarUrl = data.avatarUrl ?? data.avatar?.url ?? (publicPath ? `${baseUrl}${publicPath}` : null);
 
@@ -1279,11 +1447,11 @@ async function uploadAvatar(args) {
 async function feedStream(args) {
   const { baseUrl } = config(args);
   const maxEvents = args["max-events"] === undefined ? null : parsePositiveInteger(args["max-events"], "--max-events");
-  const response = await fetch(`${baseUrl}/api/feed/stream`, {
+  const response = await fetchWithTimeout(`${baseUrl}/api/feed/stream`, {
     headers: {
       accept: "text/event-stream",
     },
-  });
+  }, args);
 
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));

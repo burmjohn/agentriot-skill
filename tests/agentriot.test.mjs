@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -85,13 +85,38 @@ function validPlaybookPayload(overrides = {}) {
   };
 }
 
+function validLoopPayload(overrides = {}) {
+  return validPlaybookPayload({
+    kind: "loop",
+    title: "Launch evidence loop",
+    description: "A bounded loop for launch-readiness evidence.",
+    instructions: "Collect launch evidence, evaluate gaps, retry once, and publish the final decision.",
+    outputExample: "Decision: hold. Proof: uptime check failed. Next action: fix health check.",
+    loopSpec: {
+      trigger: "Run before each public launch checkpoint.",
+      goal: "Produce a launch decision backed by public-safe evidence.",
+      iteration: "Collect evidence, evaluate against the checklist, fix one blocker, and retry.",
+      verification: "Attach test, benchmark, checklist, or reviewer proof.",
+      memoryState: "Read the last launch decision and write the current outcome.",
+      tools: ["GitHub", "Playwright"],
+      budget: "Two iterations or 30 minutes, whichever comes first.",
+      stopCondition: "Stop when the checklist passes or a named blocker remains.",
+      failureHandling: "Escalate to the operator after repeated failures or unavailable tools.",
+      safetyConstraints: "Do not expose secrets, private repo data, or production credentials.",
+      exampleOutput: "Decision, evidence, risks, and next action.",
+    },
+    tags: ["launch", "loop"],
+    ...overrides,
+  });
+}
+
 function protocolResponse(overrides = {}) {
   return {
     protocolVersion: "2026.05.16",
     skill: {
       name: "agentriot",
-      recommendedVersion: "0.9.0",
-      minimumVersion: "0.9.0",
+      recommendedVersion: "0.10.0",
+      minimumVersion: "0.10.0",
     },
     contract: {
       version: "2026.05.16",
@@ -125,8 +150,8 @@ test("check-updates compares local skill version to protocol metadata", async ()
       protocolVersion: "2026.05.01",
       skill: {
         name: "agentriot",
-        recommendedVersion: "0.9.0",
-        minimumVersion: "0.9.0",
+        recommendedVersion: "0.10.0",
+        minimumVersion: "0.10.0",
       },
       promptRevision: "agentriot-onboarding-2026-05-01",
       docs: {
@@ -142,7 +167,24 @@ test("check-updates compares local skill version to protocol metadata", async ()
     assert.equal(result.command, "check-updates");
     assert.equal(result.upToDate, true);
     assert.equal(result.meetsMinimum, true);
-    assert.equal(result.localSkill.version, "0.9.0");
+    assert.equal(result.localSkill.version, "0.10.0");
+  });
+});
+
+test("network calls fail with a bounded timeout", async () => {
+  await withServer(() => {
+    // Intentionally leave the request open to exercise the CLI timeout path.
+  }, async (baseUrl) => {
+    const result = await runCliFailure([
+      "check-updates",
+      "--base-url",
+      baseUrl,
+      "--timeout-ms",
+      "50",
+    ]);
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /Request timed out after 50 ms/u);
   });
 });
 
@@ -260,6 +302,42 @@ test("register generates and persists a stable installation identity with return
   });
 });
 
+test("register writes credential state with owner-only permissions", async () => {
+  const previousUmask = process.umask(0o022);
+
+  try {
+    const inputPath = await writePayload("register.json", {
+      name: "Lifecycle Agent",
+      tagline: "Uses AgentRiot.",
+      description: "Exercises registration.",
+    });
+    const statePath = `${inputPath}.agentriot-state.json`;
+
+    await withServer(async (request, response) => {
+      if (request.url === "/api/agent-protocol") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify(protocolResponse()));
+        return;
+      }
+
+      assert.equal(request.url, "/api/agents/register");
+      response.writeHead(201, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        registrationStatus: "created",
+        agent: { id: "agt_1", slug: "lifecycle-agent", name: "Lifecycle Agent" },
+        apiKey: "agrt_secret",
+      }));
+    }, async (baseUrl) => {
+      await runCli(["register", "--input", inputPath, "--base-url", baseUrl]);
+
+      const mode = (await stat(statePath)).mode & 0o777;
+      assert.equal(mode, 0o600);
+    });
+  } finally {
+    process.umask(previousUmask);
+  }
+});
+
 test("register reuses the persisted installation identity on repeat registration", async () => {
   const inputPath = await writePayload("register.json", {
     name: "Lifecycle Agent",
@@ -305,6 +383,100 @@ test("register reuses the persisted installation identity on repeat registration
     assert.equal(state.installationId, "install_existing_1234567890");
     assert.equal(state.apiKey, "agrt_existing");
   });
+});
+
+test("validate accepts register payloads before register injects installation identity", async () => {
+  const inputPath = await writePayload("register.json", {
+    name: "Lifecycle Agent",
+    tagline: "Uses AgentRiot.",
+    description: "Exercises registration.",
+  });
+
+  const result = await runCli(["validate", "--type", "register", "--input", inputPath]);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.command, "validate");
+  assert.equal(result.type, "register");
+  assert.equal(result.validation.valid, true);
+});
+
+test("credential-bearing commands reject non-HTTPS non-loopback base URLs even when contract checks are skipped", async () => {
+  const inputPath = await writePayload("update.json", {
+    title: "Launched pipeline",
+    summary: "New pipeline processes research notes.",
+    whatChanged: "Published a public update.",
+    signalType: "status",
+  });
+
+  const result = await runCliFailure([
+    "publish-update",
+    "--input",
+    inputPath,
+    "--slug",
+    "lifecycle-agent",
+    "--api-key",
+    "agrt_secret_key",
+    "--base-url",
+    "http://agentriot.example",
+    "--skip-contract-check",
+    "true",
+    "--dry-run",
+    "true",
+  ]);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /Credential-bearing AgentRiot commands require an HTTPS base URL/u);
+});
+
+test("register rejects non-HTTPS non-loopback base URLs because it can return credentials", async () => {
+  const inputPath = await writePayload("register.json", {
+    name: "Lifecycle Agent",
+    tagline: "Uses AgentRiot.",
+    description: "Exercises registration.",
+  });
+
+  const result = await runCliFailure([
+    "register",
+    "--input",
+    inputPath,
+    "--base-url",
+    "http://agentriot.example",
+    "--skip-contract-check",
+    "true",
+    "--dry-run",
+    "true",
+  ]);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /Credential-bearing AgentRiot commands require an HTTPS base URL/u);
+});
+
+test("credential base URL loopback exception rejects hostnames that only resemble loopback", async () => {
+  const inputPath = await writePayload("update.json", {
+    title: "Launched pipeline",
+    summary: "New pipeline processes research notes.",
+    whatChanged: "Published a public update.",
+    signalType: "status",
+  });
+
+  const result = await runCliFailure([
+    "publish-update",
+    "--input",
+    inputPath,
+    "--slug",
+    "lifecycle-agent",
+    "--api-key",
+    "agrt_secret_key",
+    "--base-url",
+    "http://127.evil.example",
+    "--skip-contract-check",
+    "true",
+    "--dry-run",
+    "true",
+  ]);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /Credential-bearing AgentRiot commands require an HTTPS base URL/u);
 });
 
 test("validate accepts a 10000 character prompt and rejects a 10001 character prompt locally", async () => {
@@ -373,6 +545,29 @@ test("validate accepts playbook payloads and exposes playbook limits", async () 
   assert.equal(valid.validation.limits.playbook.outputExample, 5000);
 });
 
+test("validate accepts loop payloads and exposes loop limits", async () => {
+  const inputPath = await writePayload("loop.json", validLoopPayload());
+
+  const valid = await runCli(["validate", "--type", "loop", "--input", inputPath]);
+
+  assert.equal(valid.ok, true);
+  assert.equal(valid.command, "validate");
+  assert.equal(valid.type, "loop");
+  assert.equal(valid.contractVersion, "2026.05.16");
+  assert.equal(valid.validation.valid, true);
+  assert.equal(valid.validation.limits.playbook.loopSpecText, 2000);
+  assert.equal(valid.validation.limits.playbook.servicesTools, 12);
+});
+
+test("validate accepts loop payloads through the playbook validator", async () => {
+  const inputPath = await writePayload("loop.json", validLoopPayload());
+
+  const valid = await runCli(["validate", "--type", "playbook", "--input", inputPath]);
+
+  assert.equal(valid.ok, true);
+  assert.equal(valid.validation.valid, true);
+});
+
 test("validate rejects invalid playbook payloads locally", async () => {
   const cases = [
     ["missing title", { title: "" }, /title is required/u],
@@ -403,6 +598,38 @@ test("validate rejects invalid playbook payloads locally", async () => {
     assert.equal(invalid.code, 1, name);
     assert.match(invalid.stderr, matcher, name);
   }
+});
+
+test("validate rejects invalid loop payloads locally", async () => {
+  const cases = [
+    ["missing kind", { kind: undefined }, /kind must be loop/u],
+    ["invalid kind", { kind: "workflow" }, /kind must be loop/u],
+    ["missing loopSpec", { loopSpec: undefined }, /loopSpec is required when kind is loop/u],
+    ["missing tools", { loopSpec: { ...validLoopPayload().loopSpec, tools: undefined } }, /loopSpec\.tools is required/u],
+    ["too many tools", { loopSpec: { ...validLoopPayload().loopSpec, tools: Array.from({ length: 13 }, (_, index) => `tool-${index}`) } }, /loopSpec\.tools must include 12 items or fewer/u],
+    ["long trigger", { loopSpec: { ...validLoopPayload().loopSpec, trigger: "t".repeat(2001) } }, /loopSpec\.trigger must be 2000 characters or fewer/u],
+    ["unsupported loop field", { loopSpec: { ...validLoopPayload().loopSpec, cadence: "daily" } }, /loopSpec\.cadence is not supported/u],
+    ["vague stop condition", { loopSpec: { ...validLoopPayload().loopSpec, stopCondition: "Run forever" } }, /loopSpec\.stopCondition must define a concrete stop condition/u],
+    ["unsafe loop text", { loopSpec: { ...validLoopPayload().loopSpec, verification: "<script>alert(1)</script>" } }, /loopSpec\.verification contains executable HTML/u],
+  ];
+
+  for (const [name, overrides, matcher] of cases) {
+    const inputPath = await writePayload("loop.json", validLoopPayload(overrides));
+    const invalid = await runCliFailure(["validate", "--type", "loop", "--input", inputPath]);
+    assert.equal(invalid.code, 1, name);
+    assert.match(invalid.stderr, matcher, name);
+  }
+});
+
+test("validate rejects loopSpec on regular playbooks", async () => {
+  const inputPath = await writePayload("playbook.json", validPlaybookPayload({
+    loopSpec: validLoopPayload().loopSpec,
+  }));
+
+  const invalid = await runCliFailure(["validate", "--type", "playbook", "--input", inputPath]);
+
+  assert.equal(invalid.code, 1);
+  assert.match(invalid.stderr, /loopSpec is only supported when kind is loop/u);
 });
 
 test("validate handles out-of-range numeric HTML entities without internal decoder errors", async () => {
@@ -717,6 +944,16 @@ test("state command masks persisted credentials and identifiers", async () => {
   assert.equal(serialized.includes("lifecycle-agent"), false);
 });
 
+test("state command fails when the requested state file is missing", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "agentriot-"));
+  const missingPath = join(dir, "missing-state.json");
+
+  const result = await runCliFailure(["state", "--state-file", missingPath]);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /Registration state file not found/u);
+});
+
 test("server validation errors include field-specific details", async () => {
   const inputPath = await writePayload("prompt.json", {
     title: "Research brief prompt",
@@ -915,6 +1152,60 @@ test("publish-playbook posts a public playbook with API key header", async () =>
   });
 });
 
+test("publish-playbook posts an Agent Loop and reports canonical loop paths", async () => {
+  const payload = validLoopPayload();
+  const inputPath = await writePayload("loop.json", payload);
+  let seenBody = null;
+
+  await withServer(async (request, response) => {
+    if (request.url === "/api/agent-protocol") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(protocolResponse()));
+      return;
+    }
+
+    assert.equal(request.method, "POST");
+    assert.equal(request.url, "/api/agents/lifecycle-agent/playbooks");
+    assert.equal(request.headers["x-api-key"], "agrt_secret_key");
+    seenBody = JSON.parse(await readRequestBody(request));
+    response.writeHead(201, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      playbook: {
+        id: "loop_1",
+        slug: "launch-evidence-loop",
+        kind: "loop",
+        title: payload.title,
+      },
+      canonicalPath: "/loops/launch-evidence-loop",
+      playbookPath: "/playbooks/launch-evidence-loop",
+      publicPath: "/playbooks/launch-evidence-loop",
+    }));
+  }, async (baseUrl) => {
+    const result = await runCli([
+      "publish-playbook",
+      "--input",
+      inputPath,
+      "--slug",
+      "lifecycle-agent",
+      "--api-key",
+      "agrt_secret_key",
+      "--base-url",
+      baseUrl,
+    ]);
+    const serialized = JSON.stringify(result);
+
+    assert.equal(result.ok, true);
+    assert.equal(result.command, "publish-playbook");
+    assert.equal(result.playbook.kind, "loop");
+    assert.equal(result.canonicalPath, "/loops/launch-evidence-loop");
+    assert.equal(result.playbookPath, "/playbooks/launch-evidence-loop");
+    assert.equal(result.publicPath, "/playbooks/launch-evidence-loop");
+    assert.equal(result.canonicalUrl, `${baseUrl}/loops/launch-evidence-loop`);
+    assert.deepEqual(seenBody, payload);
+    assert.equal(serialized.includes("agrt_secret_key"), false);
+  });
+});
+
 test("edit-playbook patches an existing public playbook", async () => {
   const payload = validPlaybookPayload({ title: "Updated daily launch review" });
   const inputPath = await writePayload("playbook.json", payload);
@@ -959,6 +1250,59 @@ test("edit-playbook patches an existing public playbook", async () => {
     assert.equal(result.command, "edit-playbook");
     assert.equal(result.publicPath, "/playbooks/daily-launch-review");
     assert.equal(result.publicUrl, `${baseUrl}/playbooks/daily-launch-review`);
+    assert.deepEqual(seenBody, payload);
+  });
+});
+
+test("edit-playbook patches an Agent Loop and keeps canonical loop path", async () => {
+  const payload = validLoopPayload({ title: "Updated launch evidence loop" });
+  const inputPath = await writePayload("loop.json", payload);
+  let seenBody = null;
+
+  await withServer(async (request, response) => {
+    if (request.url === "/api/agent-protocol") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(protocolResponse()));
+      return;
+    }
+
+    assert.equal(request.method, "PATCH");
+    assert.equal(request.url, "/api/agents/lifecycle-agent/playbooks/launch-evidence-loop");
+    assert.equal(request.headers["x-api-key"], "agrt_secret_key");
+    seenBody = JSON.parse(await readRequestBody(request));
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      playbook: {
+        id: "loop_1",
+        slug: "launch-evidence-loop",
+        kind: "loop",
+        title: payload.title,
+      },
+      canonicalPath: "/loops/launch-evidence-loop",
+      playbookPath: "/playbooks/launch-evidence-loop",
+      publicPath: "/playbooks/launch-evidence-loop",
+    }));
+  }, async (baseUrl) => {
+    const result = await runCli([
+      "edit-playbook",
+      "--input",
+      inputPath,
+      "--slug",
+      "lifecycle-agent",
+      "--playbook-slug",
+      "launch-evidence-loop",
+      "--api-key",
+      "agrt_secret_key",
+      "--base-url",
+      baseUrl,
+    ]);
+
+    assert.equal(result.ok, true);
+    assert.equal(result.command, "edit-playbook");
+    assert.equal(result.canonicalPath, "/loops/launch-evidence-loop");
+    assert.equal(result.playbookPath, "/playbooks/launch-evidence-loop");
+    assert.equal(result.publicPath, "/playbooks/launch-evidence-loop");
+    assert.equal(result.canonicalUrl, `${baseUrl}/loops/launch-evidence-loop`);
     assert.deepEqual(seenBody, payload);
   });
 });
@@ -1130,7 +1474,7 @@ test("public docs link to canonical AgentRiot references", async () => {
   }
 });
 
-test("public docs document playbook CLI support without MCP playbook claims", async () => {
+test("public docs document playbook and loop CLI support without MCP playbook claims", async () => {
   const root = new URL("../", import.meta.url);
   const readme = await readFile(new URL("README.md", root), "utf8");
   const skill = await readFile(new URL("SKILL.md", root), "utf8");
@@ -1141,7 +1485,13 @@ test("public docs document playbook CLI support without MCP playbook claims", as
     "publish-playbook",
     "edit-playbook",
     "validate --type playbook",
+    "validate --type loop",
     "Playbook Payload",
+    "Loop Payload",
+    "kind",
+    "loopSpec",
+    "canonicalPath",
+    "/loops/{slug}",
     "instructions`: 30000 characters",
     "outputExample`: 5000 characters",
     "24 hours",
@@ -1162,7 +1512,7 @@ test("public API matrix covers every known public endpoint", async () => {
   const matrix = await readFile(new URL("../references/public-api.md", import.meta.url), "utf8");
   const expected = [
     ["GET", "/api/agent-protocol", "check-updates"],
-    ["GET", "/api/mcp", "mcp-config"],
+    ["POST", "/api/mcp", "mcp-config"],
     ["GET", "/api/software", "lookup-software"],
     ["POST", "/api/agents/register", "register"],
     ["GET", "/api/agents/{slug}", "get-profile"],
