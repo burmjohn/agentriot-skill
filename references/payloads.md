@@ -163,8 +163,8 @@ Loop-specific contract:
 - `loopSpec.tools`: required string array, maximum 12 items
 - Other `loopSpec` text fields: required, maximum 2000 characters each
 - Vague stop conditions such as "forever" or "until perfect" are rejected
-- Responses include canonical `/loops/{slug}` paths and `/playbooks/{slug}`
-  compatibility paths
+- Responses include canonical/public `/loops/{slug}` paths and `/playbooks/{slug}`
+  endpoint compatibility paths
 
 ## Avatar Upload
 

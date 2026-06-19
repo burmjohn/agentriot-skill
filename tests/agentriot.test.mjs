@@ -115,8 +115,8 @@ function protocolResponse(overrides = {}) {
     protocolVersion: "2026.05.16",
     skill: {
       name: "agentriot",
-      recommendedVersion: "0.10.0",
-      minimumVersion: "0.10.0",
+      recommendedVersion: "0.10.1",
+      minimumVersion: "0.10.1",
     },
     contract: {
       version: "2026.05.16",
@@ -150,8 +150,8 @@ test("check-updates compares local skill version to protocol metadata", async ()
       protocolVersion: "2026.05.01",
       skill: {
         name: "agentriot",
-        recommendedVersion: "0.10.0",
-        minimumVersion: "0.10.0",
+        recommendedVersion: "0.10.1",
+        minimumVersion: "0.10.1",
       },
       promptRevision: "agentriot-onboarding-2026-05-01",
       docs: {
@@ -167,7 +167,7 @@ test("check-updates compares local skill version to protocol metadata", async ()
     assert.equal(result.command, "check-updates");
     assert.equal(result.upToDate, true);
     assert.equal(result.meetsMinimum, true);
-    assert.equal(result.localSkill.version, "0.10.0");
+    assert.equal(result.localSkill.version, "0.10.1");
   });
 });
 
@@ -1178,7 +1178,6 @@ test("publish-playbook posts an Agent Loop and reports canonical loop paths", as
       },
       canonicalPath: "/loops/launch-evidence-loop",
       playbookPath: "/playbooks/launch-evidence-loop",
-      publicPath: "/playbooks/launch-evidence-loop",
     }));
   }, async (baseUrl) => {
     const result = await runCli([
@@ -1199,8 +1198,9 @@ test("publish-playbook posts an Agent Loop and reports canonical loop paths", as
     assert.equal(result.playbook.kind, "loop");
     assert.equal(result.canonicalPath, "/loops/launch-evidence-loop");
     assert.equal(result.playbookPath, "/playbooks/launch-evidence-loop");
-    assert.equal(result.publicPath, "/playbooks/launch-evidence-loop");
+    assert.equal(result.publicPath, "/loops/launch-evidence-loop");
     assert.equal(result.canonicalUrl, `${baseUrl}/loops/launch-evidence-loop`);
+    assert.equal(result.publicUrl, `${baseUrl}/loops/launch-evidence-loop`);
     assert.deepEqual(seenBody, payload);
     assert.equal(serialized.includes("agrt_secret_key"), false);
   });
@@ -1280,7 +1280,7 @@ test("edit-playbook patches an Agent Loop and keeps canonical loop path", async 
       },
       canonicalPath: "/loops/launch-evidence-loop",
       playbookPath: "/playbooks/launch-evidence-loop",
-      publicPath: "/playbooks/launch-evidence-loop",
+      publicPath: "/loops/launch-evidence-loop",
     }));
   }, async (baseUrl) => {
     const result = await runCli([
@@ -1301,8 +1301,9 @@ test("edit-playbook patches an Agent Loop and keeps canonical loop path", async 
     assert.equal(result.command, "edit-playbook");
     assert.equal(result.canonicalPath, "/loops/launch-evidence-loop");
     assert.equal(result.playbookPath, "/playbooks/launch-evidence-loop");
-    assert.equal(result.publicPath, "/playbooks/launch-evidence-loop");
+    assert.equal(result.publicPath, "/loops/launch-evidence-loop");
     assert.equal(result.canonicalUrl, `${baseUrl}/loops/launch-evidence-loop`);
+    assert.equal(result.publicUrl, `${baseUrl}/loops/launch-evidence-loop`);
     assert.deepEqual(seenBody, payload);
   });
 });

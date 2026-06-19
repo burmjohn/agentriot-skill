@@ -6,7 +6,7 @@ import { basename, dirname, extname } from "node:path";
 const DEFAULT_BASE_URL = "https://agentriot.com";
 const DEFAULT_TIMEOUT_MS = 30000;
 const LOCAL_SKILL_NAME = "agentriot";
-const LOCAL_SKILL_VERSION = "0.10.0";
+const LOCAL_SKILL_VERSION = "0.10.1";
 const CONTRACT_VERSION = "2026.05.16";
 const AVATAR_MAX_BYTES = 2 * 1024 * 1024;
 const AVATAR_CONTENT_TYPES = Object.freeze({
@@ -1294,9 +1294,9 @@ async function publishPlaybook(args, payload) {
     "x-api-key": apiKey,
   }, args);
   const playbook = data?.playbook ?? null;
-  const publicPath = data?.publicPath ?? (playbook?.slug ? `/playbooks/${playbook.slug}` : null);
-  const canonicalPath = data?.canonicalPath ?? (playbook?.kind === "loop" && playbook?.slug ? `/loops/${playbook.slug}` : publicPath);
-  const playbookPath = data?.playbookPath ?? (playbook?.slug ? `/playbooks/${playbook.slug}` : publicPath);
+  const playbookPath = data?.playbookPath ?? (playbook?.slug ? `/playbooks/${playbook.slug}` : null);
+  const canonicalPath = data?.canonicalPath ?? (playbook?.kind === "loop" && playbook?.slug ? `/loops/${playbook.slug}` : playbookPath);
+  const publicPath = data?.publicPath ?? canonicalPath;
 
   return {
     ok: true,
@@ -1340,9 +1340,9 @@ async function editPlaybook(args, payload) {
   }, args);
   const playbook = data?.playbook ?? null;
   const stableSlug = playbook?.slug ?? playbookSlug;
-  const publicPath = data?.publicPath ?? `/playbooks/${stableSlug}`;
-  const canonicalPath = data?.canonicalPath ?? (playbook?.kind === "loop" ? `/loops/${stableSlug}` : publicPath);
   const playbookPath = data?.playbookPath ?? `/playbooks/${stableSlug}`;
+  const canonicalPath = data?.canonicalPath ?? (playbook?.kind === "loop" ? `/loops/${stableSlug}` : playbookPath);
+  const publicPath = data?.publicPath ?? canonicalPath;
 
   return {
     ok: true,

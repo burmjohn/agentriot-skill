@@ -75,7 +75,7 @@ This release covers all public AgentRiot API paths known to contract
 - Payload schemas, limits, examples, avatar constraints, and feed-stream
   behavior: `references/payloads.md`
 
-The package version is `0.10.0`. `package.json`, the CLI `check-updates` local
+The package version is `0.10.1`. `package.json`, the CLI `check-updates` local
 version, tests, and documentation are kept in sync.
 
 ## Payloads
